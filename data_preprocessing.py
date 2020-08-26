@@ -52,7 +52,9 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
         self.times_ = X.index
         self.target_column_ = target_column
         
-        if self.storm_times_df is not None:
+        if self.storm_times_df is None:
+            self.data_ = X.to_numpy()
+        else:
             # TODO: Error handling
             times_to_include = pd.date_range(start=self.start,
                                              end=self.end,
@@ -68,6 +70,8 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
             
             storm_indices = get_storm_indices(
                 X, self.storm_times_df, self.storms_to_use, time_resolution=self.time_resolution)
+            storm_indices_concat = np.concatenate(storm_indices)
+            self.times_ = X.index[storm_indices_concat]
             
             if self.interpolate:
                 processed_data = np.vstack([X.iloc[storm_indices[i]].interpolate(
@@ -77,19 +81,15 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
                     storm=i) for i in range(len(storm_indices))])
             
             self.storm_labels_ = processed_data[:,-1].astype(int)
-            self.X_ = np.delete(processed_data, -1, axis=1)
-
+            # Remove storm column
+            self.data_ = np.delete(processed_data, -1, axis=1)
+        
         return self
     
     def transform(self, X, y=None):
-        if self.storm_times_df is None:
-            X_ = X.to_numpy()
-            y_ = X_[:,self.target_column_]
-            return X_, y_
-        else:
-            # TODO: Not memory efficient 
-            y_ = self.X_[:,self.target_column_]
-            return self.X_, y_
+        X_ = np.delete(self.data_, self.target_column_, axis=1)
+        y_ = self.data_[:,self.target_column_]
+        return X_, y_
     
     def get_column_names(self):
         return self.columns_
@@ -105,6 +105,7 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
 
 # returns array of pd dataframes for each storm 
 
+# TODO: Put interpolater here and allow user to specify it 
 class LagFeatureProcessor(BaseEstimator, TransformerMixin):
     def __init__(self, 
                  auto_order=10,
@@ -146,7 +147,7 @@ class LagFeatureProcessor(BaseEstimator, TransformerMixin):
         X_ = np.delete(X[idx,:], self.target_column, axis=1)
 
         # TODO: write my own version
-        p = MetaLagFeatureProcessor(X_, y_, self.auto_order, [self.exog_order]*X.shape[0], [0]*X.shape[0])
+        p = MetaLagFeatureProcessor(X_, y_, self.auto_order, [self.exog_order]*X_.shape[1], [0]*X_.shape[1])
         lagged_features = p.generate_lag_features()
         return lagged_features
 
