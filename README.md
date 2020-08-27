@@ -1,2 +1,1 @@
-# GeoMagTS
-
+# GeoMAGTS
