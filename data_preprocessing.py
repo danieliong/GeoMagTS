@@ -33,7 +33,7 @@ class timeResolutionResampler(BaseEstimator, TransformerMixin):
 class stormsProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
                  storm_times_df=None,
-                 storms_to_use=None, 
+                 storms_to_use=None,
                  start='1980', 
                  end='2020',
                  time_resolution='5T',
@@ -81,8 +81,9 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
                     storm=i) for i in range(len(storm_indices))])
             
             self.storm_labels_ = processed_data[:,-1].astype(int)
+            self.data_ = processed_data
             # Remove storm column
-            self.data_ = np.delete(processed_data, -1, axis=1)
+            # self.data_ = np.delete(processed_data, -1, axis=1)
         
         return self
     
@@ -102,47 +103,69 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
     
     def get_target_column(self):
         return self.target_column_
-
-# returns array of pd dataframes for each storm 
+    
+    # TODO: plot_storms function
+    def plot_storms(self):
+        pass     
 
 # TODO: Put interpolater here and allow user to specify it 
 class LagFeatureProcessor(BaseEstimator, TransformerMixin):
     def __init__(self, 
                  auto_order=10,
                  exog_order=10,
-                 target_column=None,
-                 storm_labels=None):
+                 target_column=0,
+                 label_column=-1):
+                #  storm_labels=None):
         self.auto_order = auto_order
         self.exog_order = exog_order
         self.target_column = target_column
-        self.storm_labels = storm_labels
+        self.label_column = label_column
+        # self.storm_labels = storm_labels
         
     def fit(self, X, y=None):
-        if self.target_column is None:
-            raise ValueError("target_column must be specified.")
+        # Input validation
+        # if self.target_column is None:
+        #     raise ValueError("target_column must be specified.")
+        X = check_array(X)
         check_scalar(self.target_column, 
                      name='target_column', 
                      target_type=int,
                      min_val=0,
                      max_val=X.shape[1]-1)
+        # check_scalar(self.label_column, 
+        #              name='target_column', 
+        #              target_type=int,
+        #              min_val=0,
+        #              max_val=X.shape[1]-1)
+        if self.label_column == self.target_column:
+            raise ValueError("label_column cannot be equal to target_column.")
+        # Save storm labels    
+        self.storm_labels_ = X[:,self.label_column]  
+        
         return self
     
     # IDEA: Let y contain target and get rid of target_column
     def transform(self, X, y=None):
-        if self.storm_labels is None:
+        check_is_fitted(self)
+        if self.label_column is None:
+        # if self.storm_labels_ is None:
             features = self._transform_one_storm(X)
         else:
-            unique_labels = np.unique(self.storm_labels)
+            unique_labels = np.unique(self.storm_labels_)
+            # Remove label column
+            X = np.delete(X, self.label_column, axis=1)
+            
+            # Get lag features for each storm and combine
             features = np.vstack([self._transform_one_storm(X, i) 
                     for i in unique_labels])
         features = check_array(features, force_all_finite='allow-nan')
         return features
              
     def _transform_one_storm(self, X, storm_label=None):
-        if storm_label is None and self.storm_labels is not None:
+        if storm_label is None and self.storm_labels_ is not None:
             raise ValueError("storm_label must be specified.")
         
-        idx = np.where(self.storm_labels == storm_label)[0]
+        idx = np.where(self.storm_labels_ == storm_label)[0]
         y_ = X[idx,self.target_column]
         X_ = np.delete(X[idx,:], self.target_column, axis=1)
 
@@ -150,6 +173,10 @@ class LagFeatureProcessor(BaseEstimator, TransformerMixin):
         p = MetaLagFeatureProcessor(X_, y_, self.auto_order, [self.exog_order]*X_.shape[1], [0]*X_.shape[1])
         lagged_features = p.generate_lag_features()
         return lagged_features
+
+    def get_storm_labels(self):
+        check_is_fitted(self)
+        return self.storm_labels_
 
 # IDEA: Put this into GeoMagTSRegressor
 class TargetProcessor(BaseEstimator, TransformerMixin):
