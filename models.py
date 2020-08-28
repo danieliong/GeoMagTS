@@ -126,8 +126,6 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
                     label='Truth', color='black', linewidth=0.5)
             ax.plot(times, y_pred,
                     label=str(self.pred_step)+'-step ahead prediction', color='red', linewidth=0.5)
-            # TODO: Change x-axis ticks 
-            # ax.xaxis.set_ticks()
         ax.legend()
         locator = mdates.AutoDateLocator(minticks=15)
         formatter = mdates.ConciseDateFormatter(locator)
@@ -189,3 +187,13 @@ class GeoMagARX(GeoMagTSRegressor):
               
         return coef_df
     
+class PersistenceModel(BaseEstimator, RegressorMixin):
+    def __init__(self, pred_step=1,
+                 transformer_X=None, 
+                 transformer_y=None):
+        self.pred_step = pred_step
+        self.transformer_X = transformer_X
+        self.transformer_y = transformer_y
+    
+    
+      
