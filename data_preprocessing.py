@@ -4,8 +4,7 @@ from sklearn.utils.validation import check_is_fitted, check_X_y, check_array, ch
 
 import numpy as np
 import pandas as pd
-from fireTS.utils import MetaLagFeatureProcessor, shift
-from GeoMagTS.utils import get_storm_indices
+from GeoMagTS.utils import get_storm_indices, MetaLagFeatureProcessor, shift
 import matplotlib.pyplot as plt
 
 class DataFrameSelector(BaseEstimator, TransformerMixin):
@@ -178,7 +177,6 @@ class LagFeatureProcessor(BaseEstimator, TransformerMixin):
         check_is_fitted(self)
         return self.storm_labels_
 
-# IDEA: Put this into GeoMagTSRegressor
 class TargetProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
                  pred_step=1, storm_labels=None):
