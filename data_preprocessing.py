@@ -91,6 +91,11 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
         y_ = self.data_[:,self.target_column_]
         return X_, y_
     
+    def get_prop_times(vx_colname='vx_gse', D=1500000):
+        vx_idx = np.where(self.columns_ == vx_colname)[0]
+        vx = self.data_[:,vx_idx].flatten()
+        return D / np.abs(vx)
+        
     def get_column_names(self):
         return self.columns_
     
@@ -205,4 +210,8 @@ class TargetProcessor(BaseEstimator, TransformerMixin):
         target = shift(X[idx], -self.pred_step)
         return target
 
-
+class TargetProcessorPropagated(BaseEstimator, TransformerMixin):
+    def __init__(self, prop_times=None, 
+                 storm_labels=None):
+        self.prop_times = prop_times
+        self.storm_labels = storm_labels
