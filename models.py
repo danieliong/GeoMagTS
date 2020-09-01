@@ -23,6 +23,7 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
                  #  target_column=None,
                  transformer_X=None,
                  transformer_y=None,
+                 propagated_times = None, # TODO: Remove later 
                  **estimator_params):
         self.base_estimator = base_estimator.set_params(**estimator_params)
         
@@ -33,6 +34,7 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
         # self.target_column = target_column
         self.transformer_X = transformer_X
         self.transformer_y = transformer_y
+        self.propagated_times = propagated_times
 
     def fit(self, X, y, label_column=-1, **fit_args):
         # Input validation
@@ -59,7 +61,8 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
         ### Process target 
         self.target_processor_ = TargetProcessor(
             pred_step=self.pred_step,
-            storm_labels=storm_labels)
+            storm_labels=storm_labels,
+            propagated_times=self.propagated_times)
         if self.transformer_y is not None:
             y = self.transformer_y.fit_transform(y.reshape(-1, 1)).flatten()
         y_ = self.target_processor_.fit_transform(y)
