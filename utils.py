@@ -102,8 +102,12 @@ class trainTestStormSplit():
 
     def split_data(self, X, y):
         # TODO: Input validation
-        X_train, y_train = X[self.train_idx, :], y[self.train_idx]
-        X_test, y_test = X[self.test_idx, :], y[self.test_idx]
+        if isinstance(X, pd.DataFrame) and isinstance(y, pd.Series):
+            X_train, y_train = X.iloc[self.train_idx], y.iloc[self.train_idx]
+            X_test, y_test = X.iloc[self.test_idx], y.iloc[self.test_idx]
+        else:
+            X_train, y_train = X[self.train_idx,:], y[self.train_idx]
+            X_test, y_test = X[self.test_idx, :], y[self.test_idx]
         return X_train, y_train, X_test, y_test
 
     def split_storm_labels(self):
