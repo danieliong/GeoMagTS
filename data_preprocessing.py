@@ -75,7 +75,9 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
 
             if self.storms_to_use is None:
                 self.storms_to_use = self.storm_times_df.index
-
+            else:
+                self.storms_to_use = self.storm_times_df.index.intersection(self.storms_to_use)
+            
             storm_indices = get_storm_indices(
                 X, self.storm_times_df, self.storms_to_use, time_resolution=self.time_resolution)
             storm_indices_concat = np.concatenate(storm_indices)
@@ -101,10 +103,10 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
         return X_, y_
 
     def get_propagated_times(self, vx_colname='vx_gse', D=1500000):
-        
+
         def _get_propagated_time(x):
             return x.times + pd.Timedelta(x[vx_colname])
-        
+
         vx = self.data_[vx_colname]
         prop_times = pd.Series(D / np.abs(vx), name='prop_times')
         propagated_times = prop_times.reset_index().apply(
@@ -147,49 +149,40 @@ class LagFeatureProcessor(BaseEstimator, TransformerMixin):
         # Input validation
         # if self.target_column is None:
         #     raise ValueError("target_column must be specified.")
-        X = check_array(X)
-        check_scalar(self.target_column,
-                     name='target_column',
-                     target_type=int,
-                     min_val=0,
-                     max_val=X.shape[1]-1)
-        # check_scalar(self.label_column,
-        #              name='target_column',
-        #              target_type=int,
-        #              min_val=0,
-        #              max_val=X.shape[1]-1)
+        _ = check_array(X)
         if self.label_column == self.target_column:
-            raise ValueError("label_column cannot be equal to target_column.")
+            raise ValueError("label_column cannot be the same as target_column.")
         # Save storm labels
-        self.storm_labels_ = X[:, self.label_column]
-
+        self.storm_labels_ = X[self.label_column]
         return self
 
     # IDEA: Let y contain target and get rid of target_column
     def transform(self, X, y=None):
-        check_is_fitted(self)
+        # check_is_fitted(self)
         if self.label_column is None:
             # if self.storm_labels_ is None:
             features = self._transform_one_storm(X)
         else:
-            unique_labels = np.unique(self.storm_labels_)
+            # TODO: Handle case when X is np array
+            # unique_labels = np.unique(self.storm_labels_)
             # Remove label column
-            X = np.delete(X, self.label_column, axis=1)
+            # X = np.delete(X, self.label_column, axis=1)
 
             # Get lag features for each storm and combine
-            features = np.vstack([self._transform_one_storm(X, i)
-                                  for i in unique_labels])
+            # features = np.vstack([self._transform_one_storm(X, i)
+            #                       for i in unique_labels])
+            
+            features = np.vstack(
+                X.groupby(by=self.label_column).apply(self._transform_one_storm)
+                )
+            
         features = check_array(features, force_all_finite='allow-nan')
         return features
 
-    def _transform_one_storm(self, X, storm_label=None):
-        if storm_label is None and self.storm_labels_ is not None:
-            raise ValueError("storm_label must be specified.")
-
-        idx = np.where(self.storm_labels_ == storm_label)[0]
-        y_ = X[idx, self.target_column]
-        X_ = np.delete(X[idx, :], self.target_column, axis=1)
-
+    def _transform_one_storm(self, X):
+        y_ = X.iloc[:,self.target_column].to_numpy()
+        X_ = X.drop(columns=[self.label_column, X.columns[self.target_column]]).to_numpy()
+        
         # TODO: write my own version
         p = MetaLagFeatureProcessor(X_, y_, self.auto_order, [
                                     self.exog_order]*X_.shape[1], [0]*X_.shape[1])
@@ -205,11 +198,9 @@ class TargetProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
                  pred_step=0,
                  storm_labels=None,
-                 #  times=None,
                  propagated_times=None):
         self.pred_step = pred_step
         self.storm_labels = storm_labels
-        # self.times = times
         self.propagated_times = propagated_times
 
     def fit(self, X, y=None):
@@ -218,37 +209,15 @@ class TargetProcessor(BaseEstimator, TransformerMixin):
             if X.shape[0] != len(self.propagated_times):
                 raise ValueError(
                     "X.shape[0] must be equal to the length of propagated_times.")
-
-            idx_repeats = self._get_idx_repeats_propagated_times()
-
+            if X.index.duplicated().any():
+                raise ValueError("X has duplicated indices.")
+            if self.propagated_times.duplicated().any():
+                raise ValueError("propagated_times has duplicate times.")
+            
         return self
 
     def transform(self, X, y=None):
-        # check_is_fitted(self)
-        if self.storm_labels is None:
-            target = self._transform_one_storm(X)
-        else:
-            unique_labels = np.unique(self.storm_labels)
-            target = np.concatenate([self._transform_one_storm(X, i)
-                                     for i in unique_labels])
-        target = check_array(
-            target, force_all_finite='allow-nan', ensure_2d=False)
-        return target
-
-    def _transform_one_storm(self, X, storm_label=None):
-        if storm_label is None and self.storm_labels is not None:
-            raise ValueError("storm_label must be specified.")
-
-        idx = np.where(self.storm_labels == storm_label)[0]
-        target = shift(X[idx], -self.pred_step)
-        return target
-
-    def _get_idx_repeats_propagated_times(self):
-        # "Last always wins" in dictionary comprehensions
-        return {time: idx
-                for time, idx in zip(self.propagated_times,
-                                     range(len(self.propagated_times))
-                                     )}
+        return X.reindex(self.propagated_times).to_numpy()
 
 
 class TargetProcessorPropagated(BaseEstimator, TransformerMixin):
@@ -263,7 +232,7 @@ class TargetProcessorPropagated(BaseEstimator, TransformerMixin):
 
         return self
 
-    def transform(X, y=None):
+    def transform(self, X, y=None):
         pass
 
     def _transform_one_storm(self, X, storm_label=None):
