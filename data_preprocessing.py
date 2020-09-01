@@ -54,7 +54,7 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
         self.min_threshold = min_threshold
         self.interpolate = interpolate
 
-    def fit(self, X, y=None, target_column=0):
+    def fit(self, X, y=None, target_column='sym_h'):
         self.columns_ = X.columns
         self.times_ = X.index
         self.target_column_ = target_column
@@ -81,13 +81,13 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
             self.times_ = X.index[storm_indices_concat]
 
             if self.interpolate:
-                processed_data = np.vstack([X.iloc[storm_indices[i]].interpolate(
+                processed_data = pd.concat([X.iloc[storm_indices[i]].interpolate(
                     method='time', axis=0, limit_direction='both').assign(storm=i) for i in range(len(storm_indices))])
             else:
-                processed_data = np.vstack([X.iloc[storm_indices[i]].assign(
+                processed_data = pd.concat([X.iloc[storm_indices[i]].assign(
                     storm=i) for i in range(len(storm_indices))])
 
-            self.storm_labels_ = processed_data[:, -1].astype(int)
+            self.storm_labels_ = processed_data['storm']
             self.data_ = processed_data
             # Remove storm column
             # self.data_ = np.delete(processed_data, -1, axis=1)
@@ -96,12 +96,12 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
 
     def transform(self, X, y=None):
         X_ = np.delete(self.data_, self.target_column_, axis=1)
+        X_ = self.data_.drop(columns=self.target_column_)
         y_ = self.data_[:, self.target_column_]
         return X_, y_
 
     def get_propagated_times(self, vx_colname='vx_gse', D=1500000):
-        vx_idx = np.where(self.columns_ == vx_colname)[0]
-        vx = self.data_[:, vx_idx].flatten()
+        vx = self.data_[vx_colname]
         prop_times = D / np.abs(vx)
         propagated_times = pd.DatetimeIndex(
             [time+pd.Timedelta(seconds=prop_time)
