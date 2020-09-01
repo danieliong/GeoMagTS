@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 
 # IDEA: Might be better to change to handling pd dataframes instead of np arrays
 
+
 class DataFrameSelector(BaseEstimator, TransformerMixin):
     def __init__(self, column_names=None):
         self.column_names = column_names
@@ -95,17 +96,19 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X, y=None):
-        X_ = np.delete(self.data_, self.target_column_, axis=1)
         X_ = self.data_.drop(columns=self.target_column_)
-        y_ = self.data_[:, self.target_column_]
+        y_ = self.data_[self.target_column_]
         return X_, y_
 
     def get_propagated_times(self, vx_colname='vx_gse', D=1500000):
+        
+        def _get_propagated_time(x):
+            return x.times + pd.Timedelta(x[vx_colname])
+        
         vx = self.data_[vx_colname]
-        prop_times = D / np.abs(vx)
-        propagated_times = pd.DatetimeIndex(
-            [time+pd.Timedelta(seconds=prop_time)
-             for time, prop_time in zip(self.times_, prop_times)])
+        prop_times = pd.Series(D / np.abs(vx), name='prop_times')
+        propagated_times = prop_times.reset_index().apply(
+            lambda x: (x.times + pd.Timedelta(x['prop_times'], unit='sec')).floor(freq=self.time_resolution), axis=1)
         return propagated_times
 
     def get_column_names(self):
@@ -215,7 +218,7 @@ class TargetProcessor(BaseEstimator, TransformerMixin):
             if X.shape[0] != len(self.propagated_times):
                 raise ValueError(
                     "X.shape[0] must be equal to the length of propagated_times.")
-            
+
             idx_repeats = self._get_idx_repeats_propagated_times()
 
         return self
@@ -242,8 +245,8 @@ class TargetProcessor(BaseEstimator, TransformerMixin):
 
     def _get_idx_repeats_propagated_times(self):
         # "Last always wins" in dictionary comprehensions
-        return {time: idx 
-                for time, idx in zip(self.propagated_times, 
+        return {time: idx
+                for time, idx in zip(self.propagated_times,
                                      range(len(self.propagated_times))
                                      )}
 
