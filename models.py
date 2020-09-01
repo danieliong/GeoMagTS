@@ -18,11 +18,13 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
                  base_estimator=None,
                  auto_order=10,
                  exog_order=10,
-                 pred_step=1,
+                 pred_step=0,
                  #  storm_labels=None,
                  #  target_column=None,
                  transformer_X=None,
                  transformer_y=None,
+                 vx_colname='vx_gse',
+                 D=1500000,
                  propagated_times = None, # TODO: Remove later 
                  **estimator_params):
         self.base_estimator = base_estimator.set_params(**estimator_params)
@@ -34,12 +36,47 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
         # self.target_column = target_column
         self.transformer_X = transformer_X
         self.transformer_y = transformer_y
-        self.propagated_times = propagated_times
+        # self.propagated_times = propagated_times
+        self.vx_colname = vx_colname
+        self.D = D
+        
+    def _remove_duplicates(self, X, y):
+        # Remove duplicated indices in X, y
+        idx_dupl = X.index.duplicated()
+        # Remove duplicated times in propagated_times
+        prop_time_dupl_ = self.propagated_times.duplicated(
+            keep='last').values
+        
+        mask = np.logical_or(idx_dupl, prop_time_dupl_)
+        self.propagated_times_ = self.propagated_times[~mask]
+        return X[~mask], y[~mask]
+    
+    # INCOMPLETE 
+    def _compute_propagated_times(self, X, 
+                                  vx_colname, D):
+        
+        def _compute_propagated_time(x):
+            return x.name + pd.Timedelta(x['prop_times'], unit='sec')
+        # TODO: Get frequency of X 
+        
+        times_df_ = X[vx_colname].to_frame()
+        times_df_['prop_times'] = D / times_df_[vx_colname].abs()
+        propagated_times = times_df_.apply(_compute_propagated_time)    
 
-    def fit(self, X, y, label_column=-1, **fit_args):
+    def fit(self, X, y, label_column='storm', **fit_args):
         # Input validation
-        X, y = check_X_y(X, y, y_numeric=True)
-
+        _ = check_X_y(X, y, y_numeric=True)
+        
+        # Check if X, y have same times
+        if not X.index.equals(y.index):
+            raise ValueError("X, y do not have the same indices.")
+        
+        X, y = self._remove_duplicates(X, y)
+        
+        # INCOMPLETE 
+        # propagated_times = self._compute_propagated_times(
+        #     X=X, vx_colname=self.vx_colname, D=self.D)
+        
         ### Process features
         # IDEA: Write function for this. predict does something similar
         self.lag_feature_processor_ = LagFeatureProcessor(
@@ -47,14 +84,13 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
             exog_order=self.exog_order,
             target_column=0,
             label_column=label_column)
-        concat_data = np.concatenate([y.reshape(-1, 1), X], axis=1)
-        if self.transformer_X is not None:
-            # Mask for removing label_column
-            X_mask = [True]*X.shape[1]
-            X_mask[label_column] = False
-            mask = [True] + X_mask
-            # Transform data           
-            concat_data[:,mask] = self.transformer_X.fit_transform(concat_data[:,mask])
+        if self.transformer_X is None:
+            concat_data = pd.concat([y, X], axis=1)
+        else:
+            self.transformer_X.fit(X.drop(columns=label_column))
+            X_transf = self._transform_X_pd(X, label_column)
+            concat_data = pd.concat([y, X_transf], axis=1)
+                       
         X_ = self.lag_feature_processor_.fit_transform(concat_data)
         storm_labels = self.lag_feature_processor_.get_storm_labels()
         
@@ -62,11 +98,13 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
         self.target_processor_ = TargetProcessor(
             pred_step=self.pred_step,
             storm_labels=storm_labels,
-            propagated_times=self.propagated_times)
+            propagated_times=self.propagated_times_)
         if self.transformer_y is not None:
-            y = self.transformer_y.fit_transform(y.reshape(-1, 1)).flatten()
+            y_np = y.to_numpy()
+            y_np = self.transformer_y.fit_transform(y_np.reshape(-1, 1)).flatten()
+            y = pd.Series(y_np, index=y.index)
         y_ = self.target_processor_.fit_transform(y)
-
+        
         # Remove NAs induced by LagFeatureProcessor, TargetProcessor
         X_y_mask = _get_NA_mask(X_, y_)
         target, features = X_[~X_y_mask], y_[~X_y_mask]
@@ -81,7 +119,16 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
         self.base_estimator_fitted_.fit(target, features, **fit_args)
         return self    
 
-    def predict(self, X, y, label_column=-1):
+    # Hacky way of getting transformer to output pd DataFrame
+    def _transform_X_pd(self, X, label_column=None):
+        X_transf = self.transformer_X.transform(X.drop(columns=label_column))
+        X_transf = pd.DataFrame(X_transf, 
+                                index=X.index,
+                                columns=X.columns.drop(label_column))
+        X_transf[label_column] = X[label_column]
+        return X_transf
+
+    def predict(self, X, y, label_column='storm'):
         check_is_fitted(self)
 
         lag_feature_processor_ = LagFeatureProcessor(
@@ -89,14 +136,17 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
             exog_order=self.exog_order,
             target_column=0,
             label_column=label_column)
-        concat_data = np.concatenate([y.reshape(-1, 1), X], axis=1)
-        if self.transformer_X is not None:
+        if self.transformer_X is None:
+            concat_data = pd.concat([y, X], axis=1)
+        else:
             # Mask for removing label_column
-            X_mask = [True]*X.shape[1]
-            X_mask[label_column] = False
-            mask = [True] + X_mask
+            # X_mask = [True]*X.shape[1]
+            # X_mask[label_column] = False
+            # mask = [True] + X_mask
             # Transform data
-            concat_data[:, mask] = self.transformer_X.transform(concat_data[:, mask])
+            self.transformer_X.fit(X.drop(columns=label_column))
+            X_transf = self._transform_X_pd(X, label_column)
+            concat_data = pd.concat([y, X_transf], axis=1)
         X_ = lag_feature_processor_.fit_transform(concat_data)
         X_mask = _get_NA_mask(X_)
         features = X_[~X_mask]
