@@ -67,7 +67,8 @@ class StormsProcessor(BaseEstimator, TransformerMixin):
                  vx_colname='vx_gse',
                  D=1500000,
                  min_threshold=None,
-                 interpolate=True):
+                 interpolate=True,
+                 interpolate_method='time'):
         self.storm_times_df = storm_times_df
         self.storms_to_use = storms_to_use
         self.storms_to_delete = storms_to_delete
@@ -77,6 +78,7 @@ class StormsProcessor(BaseEstimator, TransformerMixin):
         self.time_resolution = time_resolution
         self.min_threshold = min_threshold
         self.interpolate = interpolate
+        self.interpolate_method = interpolate_method
 
     def fit(self, X, y=None):
         self.columns_ = X.columns
@@ -116,7 +118,8 @@ class StormsProcessor(BaseEstimator, TransformerMixin):
 
         if self.interpolate:
             X_one_storm = X_one_storm.interpolate(
-                method='time', axis=0, limit_direction='both')
+                method=self.interpolate_method,
+                axis=0, limit_direction='both')
 
         return X_one_storm
 
@@ -133,6 +136,7 @@ class StormsProcessor(BaseEstimator, TransformerMixin):
         else:
             return X
 
+    # TODO: Delete later
     def get_propagated_times(self, vx_colname='vx_gse', D=1500000):
 
         def _get_propagated_time(x):
@@ -153,6 +157,58 @@ class StormsProcessor(BaseEstimator, TransformerMixin):
     # TODO: plot_storms function
     def plot_storms(self):
         pass
+
+# Returns df with 3rd index = propagated_time
+
+
+class PropagationTimeShifter(BaseEstimator, TransformerMixin):
+    def __init__(self,
+                 Vx=None,
+                 time_resolution='5T',
+                 D=1500000):
+        self.Vx = Vx
+        self.time_resolution = time_resolution
+        self.D = D
+
+    def fit(self, X, y=None, time_level=1):
+        self.time_level_ = time_level
+        if self.Vx is not None:
+            if not isinstance(self.Vx, pd.Series) or not isinstance(self.Vx.index, pd.MultiIndex):
+                raise TypeError(
+                    "PropagationTimeShifter can only accept Vx as pd.Series with MultiIndex for now.")
+
+            if X.shape[0] != self.Vx.shape[0]:
+                raise ValueError("X.shape[0] != Vx.shape[0].")
+            elif not X.index.equals(self.Vx.index):
+                raise ValueError("Index of X and Vx are not equal.")
+
+            self.Vx.index.rename(names='time', level=time_level, inplace=True)
+
+            self.propagation_in_sec = self.D / self.Vx.abs()
+            self.propagation_in_sec.rename("prop_time", inplace=True)
+
+            self.propagated_times_ = self.propagation_in_sec.reset_index(
+                level=time_level).apply(self._compute_propagated_time, axis=1)
+        return self
+
+    def _compute_propagated_time(self, x):
+        return x['time'] + pd.Timedelta(x['prop_time'], unit='sec').floor(freq=self.time_resolution)
+    
+    def _get_duplicated_mask(self, X):
+        idx_dupl = X.index.get_level_values(level=self.time_level_).duplicated()
+        prop_time_dupl = self.propagated_times_.duplicated(keep='last')
+        mask = np.logical_or(idx_dupl, prop_time_dupl).values
+        return mask
+
+    def transform(self, X, y=None):
+        check_is_fitted(self)
+        mask = self._get_duplicated_mask(X)
+
+        if self.Vx is not None:
+            return X[~mask].reindex(self.propagated_times_[~mask], 
+                                    level=self.time_level_)
+        else:
+            return X[~mask]
 
 
 class StormSplitter(BaseEstimator, TransformerMixin):
@@ -224,13 +280,6 @@ class StormSplitter(BaseEstimator, TransformerMixin):
         else:
             return self.train_storms, self.test_storms_
 
-class TimeShifter(BaseEstimator, TransformerMixin):
-    def __init__(self):
-        pass
-
-class PandasConverter(BaseEstimator, TransformerMixin):
-    def __init__(self):
-        pass
 
 class LagFeatureProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
@@ -320,23 +369,3 @@ class TargetProcessor(BaseEstimator, TransformerMixin):
 
     def transform(self, X, y=None):
         return X.reindex(self.propagated_times).to_numpy()
-
-
-class TargetProcessorPropagated(BaseEstimator, TransformerMixin):
-    def __init__(self, propagated_times=None,
-                 storm_labels=None):
-        self.propagated_times = propagated_times
-        self.storm_labels = storm_labels
-
-    def fit(self, X, y=None):
-        # Find where propagated_times have identical times
-        zip(self.propagated_times, self.propagated_times[1:])
-
-        return self
-
-    def transform(self, X, y=None):
-        pass
-
-    def _transform_one_storm(self, X, storm_label=None):
-        idx = np.where(self.storm_labels == storm_label)[0]
-        # target =
