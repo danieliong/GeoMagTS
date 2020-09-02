@@ -12,9 +12,19 @@ import matplotlib.pyplot as plt
 
 class DataFrameSelector(BaseEstimator, TransformerMixin):
     def __init__(self, column_names=None):
+        """Subset columns in pandas DataFrame 
+
+        Parameters
+        ----------
+        column_names : list of str, optional
+            A sequence of column names, by default None
+        """
         self.column_names = column_names
 
     def fit(self, X, y=None):
+        # Check if column_names are in X
+        if not all(col in X.columns for col in self.column_names):
+            raise ValueError("Not all names in column_names are in X.")
         return self
 
     def transform(self, X, y=None):
@@ -26,6 +36,15 @@ class DataFrameSelector(BaseEstimator, TransformerMixin):
 
 class timeResolutionResampler(BaseEstimator, TransformerMixin):
     def __init__(self, time_resolution='5T', func=np.mean):
+        """Changes time resolution of data
+
+        Parameters
+        ----------
+        time_resolution : DateOffset, Timedelta, or str, optional 
+            Frequency string, by default '5T'
+        func : function, optional
+            Function for aggregating data, by default np.mean
+        """
         self.time_resolution = time_resolution
         self.func = func
 
@@ -42,6 +61,7 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
                  storms_to_use=None,
                  start='1980',
                  end='2020',
+                 target_column='sym_h',
                  time_resolution='5T',
                  vx_colname='vx_gse',
                  D=1500000,
@@ -51,18 +71,16 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
         self.storms_to_use = storms_to_use
         self.start = start
         self.end = end
+        self.target_column = target_column
         self.time_resolution = time_resolution
         self.min_threshold = min_threshold
         self.interpolate = interpolate
 
-    def fit(self, X, y=None, target_column='sym_h'):
+    def fit(self, X, y=None):
         self.columns_ = X.columns
         self.times_ = X.index
-        self.target_column_ = target_column
 
-        if self.storm_times_df is None:
-            self.data_ = X.to_numpy()
-        else:
+        if self.storm_times_df is not None:
             # TODO: Error handling
             times_to_include = pd.date_range(start=self.start,
                                              end=self.end,
@@ -76,30 +94,39 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
             if self.storms_to_use is None:
                 self.storms_to_use = self.storm_times_df.index
             else:
-                self.storms_to_use = self.storm_times_df.index.intersection(self.storms_to_use)
-            
-            storm_indices = get_storm_indices(
+                self.storms_to_use = self.storm_times_df.index.intersection(
+                    self.storms_to_use)
+
+            self.storm_indices_ = get_storm_indices(
                 X, self.storm_times_df, self.storms_to_use, time_resolution=self.time_resolution)
-            storm_indices_concat = np.concatenate(storm_indices)
-            self.times_ = X.index[storm_indices_concat]
-
-            if self.interpolate:
-                processed_data = pd.concat([X.iloc[storm_indices[i]].interpolate(
-                    method='time', axis=0, limit_direction='both').assign(storm=i) for i in range(len(storm_indices))])
-            else:
-                processed_data = pd.concat([X.iloc[storm_indices[i]].assign(
-                    storm=i) for i in range(len(storm_indices))])
-
-            self.storm_labels_ = processed_data['storm']
-            self.data_ = processed_data
-            # Remove storm column
-            # self.data_ = np.delete(processed_data, -1, axis=1)
 
         return self
 
+    def _process_storm_data(self, X, storm_idx):
+        X_processed = X.iloc[self.storm_indices_[
+            storm_idx]].assign(storm=storm_idx)
+
+        if self.interpolate:
+            X_processed = X_processed.interpolate(
+                method='time', axis=0, limit_direction='both')
+
+        return X_processed
+
     def transform(self, X, y=None):
-        X_ = self.data_.drop(columns=self.target_column_)
-        y_ = self.data_[self.target_column_]
+        if self.storm_times_df is None:
+            X_ = X.drop(columns=self.target_column)
+            y_ = X[self.target_column]
+        else:
+            processed_data = pd.concat(
+                [self._process_storm_data(X, i)
+                 for i in range(len(self.storm_indices_))]
+            )
+            processed_data.reset_index(inplace=True)
+            processed_data.set_index(['storm', 'times'], inplace=True)
+
+            X_ = processed_data.drop(columns=self.target_column)
+            y_ = processed_data[self.target_column]
+
         return X_, y_
 
     def get_propagated_times(self, vx_colname='vx_gse', D=1500000):
@@ -115,12 +142,6 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
 
     def get_column_names(self):
         return self.columns_
-
-    def get_times(self):
-        return self.times_
-
-    def get_storm_labels(self):
-        return self.storm_labels_
 
     def get_target_column(self):
         return self.target_column_
@@ -142,7 +163,7 @@ class LagFeatureProcessor(BaseEstimator, TransformerMixin):
         self.auto_order = auto_order
         self.exog_order = exog_order
         self.target_column = target_column
-        self.label_column = label_column
+        # self.label_column = label_column
         # self.storm_labels = storm_labels
 
     def fit(self, X, y=None):
@@ -150,10 +171,11 @@ class LagFeatureProcessor(BaseEstimator, TransformerMixin):
         # if self.target_column is None:
         #     raise ValueError("target_column must be specified.")
         _ = check_array(X)
-        if self.label_column == self.target_column:
-            raise ValueError("label_column cannot be the same as target_column.")
+        # if self.label_column == self.target_column:
+        #     raise ValueError(
+        #         "label_column cannot be the same as target_column.")
         # Save storm labels
-        self.storm_labels_ = X[self.label_column]
+        # self.storm_labels_ = X[self.label_column]
         return self
 
     # IDEA: Let y contain target and get rid of target_column
@@ -171,18 +193,19 @@ class LagFeatureProcessor(BaseEstimator, TransformerMixin):
             # Get lag features for each storm and combine
             # features = np.vstack([self._transform_one_storm(X, i)
             #                       for i in unique_labels])
-            
+
             features = np.vstack(
                 X.groupby(by=self.label_column).apply(self._transform_one_storm)
-                )
-            
+            )
+
         features = check_array(features, force_all_finite='allow-nan')
         return features
 
     def _transform_one_storm(self, X):
-        y_ = X.iloc[:,self.target_column].to_numpy()
-        X_ = X.drop(columns=[self.label_column, X.columns[self.target_column]]).to_numpy()
-        
+        y_ = X.iloc[:, self.target_column].to_numpy()
+        X_ = X.drop(columns=[self.label_column,
+                             X.columns[self.target_column]]).to_numpy()
+
         # TODO: write my own version
         p = MetaLagFeatureProcessor(X_, y_, self.auto_order, [
                                     self.exog_order]*X_.shape[1], [0]*X_.shape[1])
@@ -213,7 +236,7 @@ class TargetProcessor(BaseEstimator, TransformerMixin):
                 raise ValueError("X has duplicated indices.")
             if self.propagated_times.duplicated().any():
                 raise ValueError("propagated_times has duplicate times.")
-            
+
         return self
 
     def transform(self, X, y=None):
