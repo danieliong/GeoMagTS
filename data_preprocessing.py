@@ -34,7 +34,7 @@ class DataFrameSelector(BaseEstimator, TransformerMixin):
             return X[self.column_names]
 
 
-class timeResolutionResampler(BaseEstimator, TransformerMixin):
+class TimeResolutionResampler(BaseEstimator, TransformerMixin):
     def __init__(self, time_resolution='5T', func=np.mean):
         """Changes time resolution of data
 
@@ -55,10 +55,11 @@ class timeResolutionResampler(BaseEstimator, TransformerMixin):
         return X.resample(self.time_resolution).apply(self.func)
 
 
-class stormsProcessor(BaseEstimator, TransformerMixin):
+class StormsProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
                  storm_times_df=None,
                  storms_to_use=None,
+                 storms_to_delete=None,
                  start='1980',
                  end='2020',
                  target_column='sym_h',
@@ -69,6 +70,7 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
                  interpolate=True):
         self.storm_times_df = storm_times_df
         self.storms_to_use = storms_to_use
+        self.storms_to_delete = storms_to_delete
         self.start = start
         self.end = end
         self.target_column = target_column
@@ -91,43 +93,45 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
                 (self.storm_times_df['end_time'] <= times_to_include[-1])
             ]
 
-            if self.storms_to_use is None:
-                self.storms_to_use = self.storm_times_df.index
+            if self.storms_to_use is None and self.storms_to_delete is None:
+                self.storms_to_use_ = self.storm_times_df.index
+            elif self.storms_to_delete is not None:
+                # TODO: Check storms_to_delete are in storm_times_df.index
+                self.storms_deleted_ = self.storm_times_df.index.intersection(
+                    self.storms_to_delete)
+                self.storms_to_use_ = self.storm_times_df.index.drop(
+                    self.storms_deleted_)
             else:
-                self.storms_to_use = self.storm_times_df.index.intersection(
+                self.storms_to_use_ = self.storm_times_df.index.intersection(
                     self.storms_to_use)
 
             self.storm_indices_ = get_storm_indices(
-                X, self.storm_times_df, self.storms_to_use, time_resolution=self.time_resolution)
+                X, self.storm_times_df, self.storms_to_use_, time_resolution=self.time_resolution)
 
         return self
 
-    def _process_storm_data(self, X, storm_idx):
-        X_processed = X.iloc[self.storm_indices_[
+    def _process_one_storm(self, X, storm_idx):
+        X_one_storm = X.iloc[self.storm_indices_[
             storm_idx]].assign(storm=storm_idx)
 
         if self.interpolate:
-            X_processed = X_processed.interpolate(
+            X_one_storm = X_one_storm.interpolate(
                 method='time', axis=0, limit_direction='both')
 
-        return X_processed
+        return X_one_storm
 
     def transform(self, X, y=None):
-        if self.storm_times_df is None:
-            X_ = X.drop(columns=self.target_column)
-            y_ = X[self.target_column]
-        else:
-            processed_data = pd.concat(
-                [self._process_storm_data(X, i)
+        if self.storm_times_df is not None:
+            X_processed = pd.concat(
+                [self._process_one_storm(X, i)
                  for i in range(len(self.storm_indices_))]
             )
-            processed_data.reset_index(inplace=True)
-            processed_data.set_index(['storm', 'times'], inplace=True)
+            X_processed.reset_index(inplace=True)
+            X_processed.set_index(['storm', 'times'], inplace=True)
 
-            X_ = processed_data.drop(columns=self.target_column)
-            y_ = processed_data[self.target_column]
-
-        return X_, y_
+            return X_processed
+        else:
+            return X
 
     def get_propagated_times(self, vx_colname='vx_gse', D=1500000):
 
@@ -150,8 +154,83 @@ class stormsProcessor(BaseEstimator, TransformerMixin):
     def plot_storms(self):
         pass
 
-# TODO: Put interpolater here and allow user to specify it
 
+class StormSplitter(BaseEstimator, TransformerMixin):
+    def __init__(self,
+                 test_storms=None,
+                 min_threshold=None,
+                 test_size=1,
+                 storm_level=0,
+                 target_column='sym_h'):
+        # TODO: Input validation
+        self.test_storms = test_storms
+        self.min_threshold = min_threshold
+        self.test_size = test_size
+        self.storm_level = storm_level
+        self.target_column = target_column
+
+    def fit(self, X, y=None):
+        # TODO: Input validation
+        y = X[self.target_column]
+        self.storm_labels_ = y.index.unique(level=self.storm_level)
+
+        if self.test_storms is None:
+
+            if self.min_threshold is None:
+                self.test_storms_ = np.random.choice(
+                    self.storm_labels_, self.test_size)
+            else:
+                min_y = y.groupby(level=self.storm_level).min()
+                self.storms_thresholded_ = self.storm_labels_[
+                    min_y < self.min_threshold]
+                self.test_storms_ = np.random.choice(
+                    self.storms_thresholded, self.test_size)
+
+            self.train_storms_ = self.storm_labels_.drop(
+                self.test_storms_).to_numpy()
+        else:
+            if not np.in1d(self.test_storms, self.storm_labels_).all():
+                raise ValueError("Not all of test_storms are in y.")
+
+            self.train_storms_ = self.storm_labels_.drop(
+                self.test_storms).to_numpy()
+
+        return self
+
+    def transform(self, X, y=None):
+        check_is_fitted(self)
+        y = X[self.target_column]
+        if self.test_storms is None:
+            test_idx = pd.IndexSlice[self.test_storms_, :]
+        else:
+            test_idx = pd.IndexSlice[self.test_storms, :]
+        train_idx = pd.IndexSlice[self.train_storms_, :]
+
+        # data = {
+        #     'X_train': X.iloc[train_idx],
+        #     'y_train': y.iloc[train_idx],
+        #     'X_test': X.iloc[test_idx],
+        #     'y_test': y.iloc[test_idx]
+        # }
+
+        X_train, y_train = X.loc[train_idx, :], y.loc[train_idx]
+        X_test, y_test = X.loc[test_idx, :], y.loc[test_idx]
+        return X_train, y_train, X_test, y_test
+
+    def get_train_test_storms(self):
+        check_is_fitted(self)
+        if self.test_storms is None:
+            return self.train_storms_, self.test_storms_
+        else:
+            return self.train_storms, self.test_storms_
+
+class TimeShifter(BaseEstimator, TransformerMixin):
+    def __init__(self):
+        pass
+
+class PandasConverter(BaseEstimator, TransformerMixin):
+    def __init__(self):
+        pass
 
 class LagFeatureProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,

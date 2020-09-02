@@ -5,6 +5,8 @@ from keras.models import Sequential
 from keras.layers import Dense
 from sklearn.utils import safe_mask
 from sklearn.model_selection import GroupShuffleSplit
+from sklearn.utils.validation import check_is_fitted
+from sklearn.base import BaseEstimator, TransformerMixin
 from numpy.random import randint
 from collections import deque
 
@@ -53,7 +55,7 @@ def create_narx_model(n_hidden, learning_rate,
     return model
 
 
-def get_min_y_storms(y, storm_labels):
+def get_min_y_storms(y, storm_labels=None):
 
     def _get_min_y_one_storm(y, storm_labels, i):
         idx = (storm_labels == i)
@@ -64,61 +66,6 @@ def get_min_y_storms(y, storm_labels):
                       for i in unique_storms]
                      )
     return min_y
-
-
-class trainTestStormSplit():
-    def __init__(self, storm_labels, test_storms=None,
-                 min_threshold=None, y=None, test_size=1):
-        # TODO: Input validation
-        self.storm_labels = storm_labels
-        self.test_storms = test_storms
-        self.min_threshold = min_threshold
-        self.test_size = test_size
-        self.unique_storm_labels = np.unique(storm_labels)
-
-        if self.test_storms is None and self.min_threshold is not None:
-            # Pick only storms with y < min_threshold to be in test set
-            if y is None:
-                raise ValueError(
-                    "y must be specified if min_threshold is given."
-                )
-
-            min_y = get_min_y_storms(y, self.storm_labels)
-            storms_thres = self.unique_storm_labels[min_y < min_threshold]
-            self.test_storms = np.random.choice(storms_thres, self.test_size)
-        elif self.test_storms is None and self.min_threshold is None:
-            # Choose random storm for testing
-            self.test_storms = np.random.choice(
-                self.unique_storm_labels, self.test_size)
-        # If test_storms is given, just use it
-        self._split_idx_by_test_storms()
-
-    def _split_idx_by_test_storms(self):
-        if self.test_storms is None:
-            raise ValueError("self.test_storms is None.")
-        test_mask = np.in1d(self.storm_labels, self.test_storms)
-        self.train_idx = np.where(~test_mask)[0]
-        self.test_idx = np.where(test_mask)[0]
-
-    def split_data(self, X, y):
-        # TODO: Input validation
-        if isinstance(X, pd.DataFrame) and isinstance(y, pd.Series):
-            X_train, y_train = X.iloc[self.train_idx], y.iloc[self.train_idx]
-            X_test, y_test = X.iloc[self.test_idx], y.iloc[self.test_idx]
-        else:
-            X_train, y_train = X[self.train_idx,:], y[self.train_idx]
-            X_test, y_test = X[self.test_idx, :], y[self.test_idx]
-        return X_train, y_train, X_test, y_test
-
-    def split_storm_labels(self):
-        return self.storm_labels[self.train_idx], self.storm_labels[self.test_idx]
-    
-    def get_train_test_indices(self):
-        return self.train_idx, self.test_idx
-
-    def get_test_storm_times(self, times):
-        # TODO: Input validation
-        return times[self.test_idx]
 
 
 # THE FUNCTIONS BELOW WERE TAKEN FROM FIRETS (https://github.com/jxx123/fireTS) AND MODIFIED SLIGHTLY
