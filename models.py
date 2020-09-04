@@ -1,7 +1,9 @@
 import numpy as np
 import pandas as pd
+import warnings
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.backends.backend_pdf import PdfPages
 
 from sklearn.utils import safe_mask
 from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
@@ -9,105 +11,138 @@ from sklearn.linear_model import LinearRegression
 from sklearn.utils.estimator_checks import check_estimator
 from sklearn.utils.validation import check_is_fitted, check_X_y, check_array, check_consistent_length
 from sklearn.metrics import mean_squared_error
+from sklearn.pipeline import Pipeline
+from pandas.tseries.frequencies import to_offset
 
-from GeoMagTS.data_preprocessing import LagFeatureProcessor, TargetProcessor
+from GeoMagTS.data_preprocessing import PropagationTimeProcessor, FeatureProcessor, TargetProcessor
 from GeoMagTS.utils import _get_NA_mask
+
+# NOTE: Converting to pandas from np slowed down the code significantly
 
 class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
     def __init__(self,
                  base_estimator=None,
-                 auto_order=10,
-                 exog_order=10,
+                 auto_order=60,
+                 exog_order=60,
                  pred_step=0,
-                 #  storm_labels=None,
-                 #  target_column=None,
                  transformer_X=None,
                  transformer_y=None,
-                 vx_colname='vx_gse',
+                 propagate=True,
+                 time_resolution='5T',
                  D=1500000,
-                 propagated_times = None, # TODO: Remove later 
                  **estimator_params):
         self.base_estimator = base_estimator.set_params(**estimator_params)
-        
         self.auto_order = auto_order
         self.exog_order = exog_order
         self.pred_step = pred_step
-        # self.storm_labels = storm_labels
-        # self.target_column = target_column
         self.transformer_X = transformer_X
         self.transformer_y = transformer_y
-        # self.propagated_times = propagated_times
-        self.vx_colname = vx_colname
+        self.propagate = propagate
+        self.time_resolution = time_resolution
         self.D = D
-        
-    def _remove_duplicates(self, X, y):
-        # Remove duplicated indices in X, y
-        idx_dupl = X.index.duplicated()
-        # Remove duplicated times in propagated_times
-        prop_time_dupl_ = self.propagated_times.duplicated(
-            keep='last').values
-        
-        mask = np.logical_or(idx_dupl, prop_time_dupl_)
-        self.propagated_times_ = self.propagated_times[~mask]
-        return X[~mask], y[~mask]
-    
-    # INCOMPLETE 
-    def _compute_propagated_times(self, X, 
-                                  vx_colname, D):
-        
-        def _compute_propagated_time(x):
-            return x.name + pd.Timedelta(x['prop_times'], unit='sec')
-        # TODO: Get frequency of X 
-        
-        times_df_ = X[vx_colname].to_frame()
-        times_df_['prop_times'] = D / times_df_[vx_colname].abs()
-        propagated_times = times_df_.apply(_compute_propagated_time)    
 
-    def fit(self, X, y, label_column='storm', **fit_args):
-        # Input validation
-        _ = check_X_y(X, y, y_numeric=True)
+    def _check_X(self, X, check_multi_index=True, check_vx_col=True, check_same_cols=False):
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("X must be a pandas object (for now).")
         
+        if isinstance(X.index, pd.MultiIndex):
+            if X.index.nlevels < 2:
+                raise ValueError(
+                    "X.index must have at least 2 levels corresponding to storm and times if it is a MultiIndex.")
+        elif check_multi_index:
+            raise TypeError("X must have a MultiIndex (for now).")
+        elif not isinstance(X.index, pd.DatetimeIndex):
+                raise TypeError("Time index must be of type pd.DatetimeIndex.")
+        
+
+        # Check if vx_colname is in X
+        if check_vx_col and self.vx_colname_ not in X.columns:
+            raise ValueError("X does not have column "+self.vx_colname_+".")
+        
+        if check_same_cols:
+            if not X.columns.equals(self.features_):
+                raise ValueError(
+                    "X used for predicting must have the same columns as the X used for training.")
+        
+        dupl_mask_ = X.index.duplicated(keep='last')
+        if dupl_mask_.any():
+            warnings.warn(
+                "Inputs have duplicated indices. Only one of each row with duplicated indices will be kept.")
+            X = X[~dupl_mask_]
+
+        return X, dupl_mask_
+
+    def _check_inputs(self, X, y):
+        _ = check_X_y(X, y, y_numeric=True)
+
+        X, self.dupl_mask_ = self._check_X(X)
+
+        if not isinstance(y, (pd.Series, pd.DataFrame)):
+            raise TypeError("y must be a pandas object (for now).")
+
         # Check if X, y have same times
         if not X.index.equals(y.index):
             raise ValueError("X, y do not have the same indices.")
-        
-        X, y = self._remove_duplicates(X, y)
-        
-        # INCOMPLETE 
-        # propagated_times = self._compute_propagated_times(
-        #     X=X, vx_colname=self.vx_colname, D=self.D)
-        
-        ### Process features
-        # IDEA: Write function for this. predict does something similar
-        self.lag_feature_processor_ = LagFeatureProcessor(
-            auto_order=self.auto_order,
-            exog_order=self.exog_order,
-            target_column=0,
-            label_column=label_column)
-        if self.transformer_X is None:
-            concat_data = pd.concat([y, X], axis=1)
-        else:
-            self.transformer_X.fit(X.drop(columns=label_column))
-            X_transf = self._transform_X_pd(X, label_column)
-            concat_data = pd.concat([y, X_transf], axis=1)
-                       
-        X_ = self.lag_feature_processor_.fit_transform(concat_data)
-        storm_labels = self.lag_feature_processor_.get_storm_labels()
-        
-        ### Process target 
+
+        # Align y with X
+        y = y[~self.dupl_mask_]
+
+        return X, y
+
+    def fit(self, X, y,
+            storm_level=0,
+            time_level=1,
+            vx_colname='vx_gse', **fit_args):
+
+        self.storm_level_ = storm_level
+        self.time_level_ = time_level
+        self.vx_colname_ = vx_colname
+
+        # Input validation
+        X, y = self._check_inputs(X, y)
+
+        self.features_ = X.columns
+
+        time_res_minutes = to_offset(self.time_resolution).delta.seconds/60
+        self.auto_order_steps_ = np.rint(
+            self.auto_order / time_res_minutes).astype(int)
+        self.exog_order_steps_ = np.rint(
+            self.exog_order / time_res_minutes).astype(int)
+
+        # Process target
         self.target_processor_ = TargetProcessor(
             pred_step=self.pred_step,
-            storm_labels=storm_labels,
-            propagated_times=self.propagated_times_)
-        if self.transformer_y is not None:
-            y_np = y.to_numpy()
-            y_np = self.transformer_y.fit_transform(y_np.reshape(-1, 1)).flatten()
-            y = pd.Series(y_np, index=y.index)
-        y_ = self.target_processor_.fit_transform(y)
-        
-        # Remove NAs induced by LagFeatureProcessor, TargetProcessor
-        X_y_mask = _get_NA_mask(X_, y_)
-        target, features = X_[~X_y_mask], y_[~X_y_mask]
+            time_resolution=self.time_resolution,
+            transformer=self.transformer_y
+        )
+        y_ = self.target_processor_.fit_transform(
+            y, storm_level=self.storm_level_, time_level=self.time_level_)
+
+        if self.propagate:
+            self.propagation_time_processor_ = PropagationTimeProcessor(
+                Vx=X[self.vx_colname_],
+                time_resolution=self.time_resolution,
+                D=self.D)
+            y_ = self.propagation_time_processor_.fit_transform(
+                y_, time_level=self.time_level_)
+
+        target_mask = self._get_target_mask()
+        X, y = X[target_mask], y[target_mask]
+
+        # Process features
+        self.feature_processor = FeatureProcessor(
+            auto_order=self.auto_order,
+            exog_order=self.exog_order,
+            transformer=self.transformer_X)
+        combined_data = pd.concat([y, X], axis=1)
+        X_ = self.feature_processor.fit_transform(
+            combined_data,
+            target_column=0,
+            storm_level=self.storm_level_,
+            time_level=self.time_level_)
+
+        mask = _get_NA_mask(X_, y_)
+        target, features = X_[mask], y_[mask]
 
         if self.base_estimator is None:
             # Default estimator is LinearRegression
@@ -117,90 +152,163 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
             self.base_estimator_fitted_ = clone(self.base_estimator)
 
         self.base_estimator_fitted_.fit(target, features, **fit_args)
-        return self    
+        return self
 
-    # Hacky way of getting transformer to output pd DataFrame
-    def _transform_X_pd(self, X, label_column=None):
-        X_transf = self.transformer_X.transform(X.drop(columns=label_column))
-        X_transf = pd.DataFrame(X_transf, 
-                                index=X.index,
-                                columns=X.columns.drop(label_column))
-        X_transf[label_column] = X[label_column]
-        return X_transf
+    def _get_target_mask(self):
+        mask = self.target_processor_.mask_
 
-    def predict(self, X, y, label_column='storm'):
+        if self.propagate:
+            prop_mask = self.propagation_time_processor_.mask_
+            return np.logical_and(mask, prop_mask)
+        else:
+            return mask
+
+    def predict(self, X, y):
+        
         check_is_fitted(self)
+        X, _ = self._check_X(X, check_multi_index=False, 
+                             check_vx_col=False, check_same_cols=True)
 
-        lag_feature_processor_ = LagFeatureProcessor(
+        test_feature_processor = FeatureProcessor(
             auto_order=self.auto_order,
             exog_order=self.exog_order,
+            time_resolution=self.time_resolution,
+            transformer=self.transformer_X,
+            fit_transformer=False)
+        combined_data = pd.concat([y, X], axis=1)
+        X_ = test_feature_processor.fit_transform(
+            X=combined_data,
             target_column=0,
-            label_column=label_column)
-        if self.transformer_X is None:
-            concat_data = pd.concat([y, X], axis=1)
-        else:
-            # Mask for removing label_column
-            # X_mask = [True]*X.shape[1]
-            # X_mask[label_column] = False
-            # mask = [True] + X_mask
-            # Transform data
-            self.transformer_X.fit(X.drop(columns=label_column))
-            X_transf = self._transform_X_pd(X, label_column)
-            concat_data = pd.concat([y, X_transf], axis=1)
-        X_ = lag_feature_processor_.fit_transform(concat_data)
-        X_mask = _get_NA_mask(X_)
-        features = X_[~X_mask]
+            storm_level=self.storm_level_,
+            time_level=self.time_level_)
 
-        y_pred_ahead = self.base_estimator_fitted_.predict(features)
+        nan_mask = _get_NA_mask(X_)
+        test_features = X_[nan_mask]
+
+        ypred_ = self.base_estimator_fitted_.predict(test_features)
+        ypred = self._process_predictions(X[nan_mask], ypred_)
+
+        return ypred
+
+    def _process_predictions(self, X, ypred):
         if self.transformer_y is not None:
-            y_pred_ahead = self.transformer_y.inverse_transform(y_pred_ahead.reshape(-1,1)).flatten()
+            check_is_fitted(self.target_processor_.transformer)
+            ypred = self.target_processor_.transformer.inverse_transform(
+                ypred.reshape(-1, 1)).flatten()
 
-        y_pred = np.empty(y.shape[0])
-        y_pred[X_mask], y_pred[~X_mask] = np.nan, y_pred_ahead  
-        y_pred_aligned = np.concatenate(
-            [np.empty(self.pred_step)*np.nan, y_pred]
-            )[0:len(y)]
- 
-        return y_pred_aligned
+        test_target_processor = TargetProcessor(
+            pred_step=self.pred_step,
+            time_resolution=self.time_resolution
+        )
+        test_prop_time_processor = PropagationTimeProcessor(
+            Vx=X[self.vx_colname_],
+            time_resolution=self.time_resolution,
+            D=self.D)
 
-    def plot_predict(self, X, y, times=None, display_info=False, **plot_params):
-        y_pred = self.predict(X, y)
-        rmse = self.score(X, y, squared=False)
+        # TODO: Find more efficient way to do this
+        # IDEA: Rewrite processors to handle case when X is index
+        if isinstance(X.index, pd.MultiIndex):
+            X_times = X.index.get_level_values(level=self.time_level_)
+            X_storms = X.index.get_level_values(level=self.storm_level_)
 
-        fig, ax = plt.subplots(sharex=True, figsize=(10, 7), **plot_params)
-        if times is None:
-            ax.plot(y, label='Truth',
-                    color='black', linewidth=0.5)
-            ax.plot(y_pred,
-                    label=str(self.pred_step)+'-step ahead prediction', color='red', linewidth=0.5)
+            shifted_times = X_times + pd.Timedelta(minutes=self.pred_step)
+            y_empty = pd.Series(index=[X_storms, shifted_times])
+            test_prop_time_processor.fit(
+                y_empty, time_level=self.time_level_)
+            pred_times = test_prop_time_processor.propagated_times_
+            ypred_processed = pd.Series(ypred, index=[X_storms, pred_times])
         else:
-            # TODO: Check if this subsetting is valid. Find better to do it?
-            ax.plot(times, y,
-                    label='Truth', color='black', linewidth=0.5)
-            ax.plot(times, y_pred,
-                    label=str(self.pred_step)+'-step ahead prediction', color='red', linewidth=0.5)
+            shifted_times = X.index + pd.Timedelta(minutes=self.pred_step)
+            y_empty = pd.Series(index=shifted_times)
+            test_prop_time_processor.fit(y_empty)
+            pred_times = test_prop_time_processor.propagated_times_
+            ypred_processed = pd.Series(ypred, index=pred_times)
+            
+        return ypred_processed
+
+    # TODO: Add interactive plot
+    def plot_predict(self, X, y,
+                     storms_to_plot=None,
+                     display_info=False,
+                     figsize=(15, 10),
+                     save=True,
+                     file_name='prediction_plot.pdf',
+                     **plot_params):
+        check_is_fitted(self)
+
+        storms_to_plot = y.index.unique(level=self.storm_level_)
+        if storms_to_plot is not None:
+            storms_to_plot = storms_to_plot.intersection(storms_to_plot)
+
+        if len(storms_to_plot) == 0:
+            warnings.warn("No storms to plot.")
+            # End function
+            return None
+        elif len(storms_to_plot) > 1:
+            idx = pd.IndexSlice
+            X = X.loc[idx[storms_to_plot, :], :]
+            y = y.loc[idx[storms_to_plot, :]]
+
+        ypred = self.predict(X, y)
+
+        # Get prediction label
+        pred_label = ''
+        if self.propagate:
+            pred_label = pred_label + 'Propagated '
+        if self.pred_step > 0:
+            pred_label = pred_label + str(self.pred_step) + 'min. ahead'
+        pred_label = pred_label + 'prediction'
+
+        if save:
+            pdf = PdfPages(file_name)
+
+        for storm in storms_to_plot:
+            
+            rmse = self.score(X.loc[storm], y.loc[storm])
+            fig, ax = self._plot_one_storm(
+                y.loc[storm], ypred.loc[storm], 
+                rmse=rmse, storm_idx=storm, pred_label=pred_label, display_info=display_info, figsize=figsize)
+            if save:
+                pdf.savefig(fig)
+            else:
+                plt.show()
+                
+        if save:
+            pdf.close()
+        return None
+
+    def _plot_one_storm(
+            self, y, ypred, rmse, storm_idx, pred_label, display_info=False,
+            figsize=(10, 7), **plot_params):
+
+        fig, ax = plt.subplots(sharex=True,
+                               figsize=figsize,
+                               **plot_params)
+        ax.plot(y, label='Truth', color='black', linewidth=0.5)
+        ax.plot(ypred, label=pred_label, color='red', linewidth=0.5)
         ax.legend()
         locator = mdates.AutoDateLocator(minticks=15)
         formatter = mdates.ConciseDateFormatter(locator)
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(formatter)
 
-        # TODO
-        if display_info:    
+        if display_info:
             ax.set_title(
+                'Storm #'+str(storm_idx)+": " +
                 'auto_order='+str(self.auto_order)+', ' +
-                'exog_order='+str(self.exog_order)+', ' +
+                'exog_order='+str(self.exog_order)+' (in minutes), ' +
                 'RMSE='+str(np.round(rmse, decimals=2)))
 
         return fig, ax
 
     def score(self, X, y, squared=False):
-        # TODO: Error handling and more options
         y_pred = self.predict(X, y)
-        mask = np.isnan(y) | np.isnan(y_pred)
 
-        return mean_squared_error(y[~mask], y_pred[~mask], squared=squared)
+        y_ = y.reindex(y_pred.index)
+        nan_mask = ~np.isnan(y_)
 
+        return mean_squared_error(
+            y_[nan_mask], y_pred[nan_mask], squared=squared)
 
     def _more_tags(self):
         return {'allow_nan': True,
@@ -209,44 +317,43 @@ class GeoMagTSRegressor(BaseEstimator, RegressorMixin):
 # estimator_checks = check_estimator(GeoMagTSRegressor())
 
 class GeoMagARX(GeoMagTSRegressor):
-    def __init__(self, auto_order=10, 
-                 exog_order=10, 
-                 pred_step=1, 
-                 transformer_X=None, 
-                 transformer_y=None, 
+    def __init__(self, auto_order=10,
+                 exog_order=10,
+                 pred_step=1,
+                 transformer_X=None,
+                 transformer_y=None,
                  **lm_params):
         base_estimator = LinearRegression()
-        super().__init__(base_estimator=base_estimator, auto_order=auto_order, exog_order=exog_order, pred_step=pred_step, transformer_X=transformer_X, transformer_y=transformer_y, **lm_params)
-    
+        super().__init__(base_estimator=base_estimator, auto_order=auto_order, exog_order=exog_order,
+                         pred_step=pred_step, transformer_X=transformer_X, transformer_y=transformer_y, **lm_params)
+
     def get_coef_df(self, feature_columns):
         check_is_fitted(self)
+
         ar_coef_names = np.array(
-            ["ar"+str(i) for i in range(self.auto_order)]
-            )
+            ["ar"+str(i) for i in range(self.auto_order_steps_)]
+        )
         exog_coef_names = np.concatenate(
-            [[x+str(i) for i in range(self.exog_order)] 
+            [[x+str(i) for i in range(self.exog_order_steps_)]
              for x in feature_columns]
-            ).T
+        ).T
         coef_names = np.concatenate([ar_coef_names, exog_coef_names])
-        
+
         coef = pd.Series(
             self.base_estimator_fitted_.coef_, index=coef_names)
         coef_df = pd.DataFrame(
             {col: coef[coef.index.str.contains(col+'[0-9]+$')].reset_index(drop=True)
              for col in ['ar']+feature_columns
              }
-            )
-        coef_df['ar'] = coef_df['ar'].shift(1)
-              
+        )
+
         return coef_df
-    
+
+
 class PersistenceModel(BaseEstimator, RegressorMixin):
     def __init__(self, pred_step=1,
-                 transformer_X=None, 
+                 transformer_X=None,
                  transformer_y=None):
         self.pred_step = pred_step
         self.transformer_X = transformer_X
         self.transformer_y = transformer_y
-    
-    
-      

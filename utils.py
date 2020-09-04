@@ -26,16 +26,19 @@ def get_storm_indices(data, stormtimes_df, include_storms, time_resolution='5T')
 
 def _get_NA_mask(X, y=None):
     if y is None:
-        mask = safe_mask(X, np.isnan(X).any(axis=1))
+        return ~safe_mask(X, np.isnan(X).any(axis=1))
     else:
-        data_ = np.concatenate([y.reshape(-1, 1), X], axis=1)
-        mask = np.isnan(data_).any(axis=1)
+        if isinstance(y, (pd.Series, pd.DataFrame)):
+            y_ = y.to_numpy()
+            data_ = np.concatenate([y_.reshape(-1, 1), X], axis=1)
+        else:
+            data_ = np.concatenate([y.reshape(-1, 1), X], axis=1)
+    
+        mask = ~np.isnan(data_).any(axis=1)
         # Check mask
         mask = safe_mask(X, mask)
         mask = safe_mask(y, mask)
-
-    return mask
-
+        return mask
 
 def create_narx_model(n_hidden, learning_rate,
                       activation_hidden='tanh',
