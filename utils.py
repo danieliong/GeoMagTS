@@ -15,7 +15,7 @@ def get_storm_indices(data, stormtimes_df, include_storms, time_resolution='5T')
     stormtimes_list = [
         pd.date_range(t['start_time'].round(time_resolution),
                       t['end_time'], freq=time_resolution)
-        for _, t in stormtimes_df.iloc[include_storms].iterrows()
+        for _, t in stormtimes_df.loc[include_storms].iterrows()
     ]
 
     try:
