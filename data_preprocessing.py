@@ -1,6 +1,7 @@
 from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
 from sklearn.utils import safe_mask, check_scalar
 from sklearn.utils.validation import check_is_fitted, check_X_y, check_array, check_consistent_length
+from sklearn.pipeline import Pipeline
 
 import numpy as np
 import pandas as pd
@@ -113,7 +114,7 @@ class StormsProcessor(BaseEstimator, TransformerMixin):
 
         return self
 
-    def _process_one_storm(self, X, storm_idx):
+    def _transform_one_storm(self, X, storm_idx):
         X_one_storm = X.iloc[self.storm_indices_[
             storm_idx]].assign(storm=storm_idx)
 
@@ -127,7 +128,7 @@ class StormsProcessor(BaseEstimator, TransformerMixin):
     def transform(self, X, y=None):
         if self.storm_times_df is not None:
             X_processed = pd.concat(
-                [self._process_one_storm(X, i)
+                [self._transform_one_storm(X, i)
                  for i in range(len(self.storm_indices_))]
             )
             X_processed.reset_index(inplace=True)
@@ -158,8 +159,6 @@ class StormsProcessor(BaseEstimator, TransformerMixin):
     # TODO: plot_storms function
     def plot_storms(self):
         pass
-
-# Returns df with 3rd index = propagated_time
 
 
 class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
@@ -228,6 +227,21 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
                 return X.reindex(self.propagated_times_[self.mask_])
         else:
             return X
+    
+    # def shift(self, X, y=None):
+    #     check_is_fitted(self)
+    #     # TODO: Handle MultiIndex case
+        
+    #     def _get_shifted_time(t):
+    #         return t + pd.Timedelta(self.propagation_in_sec_[t], unit='sec').floor(freq=self.time_resolution)
+        
+    #     if self.Vx is not None:
+    #         X_shifted = pd.Series(
+    #             [X[_get_shifted_time(t)] for t in X.index], 
+    #             index=X.index)
+    #         return X_shifted
+    #     else:
+    #         return X
 
 
 class StormSplitter(BaseEstimator, TransformerMixin):
@@ -263,7 +277,7 @@ class StormSplitter(BaseEstimator, TransformerMixin):
                 self.storms_thresholded_ = self.storm_labels_[
                     min_y < self.min_threshold]
                 self.test_storms_ = np.random.choice(
-                    self.storms_thresholded, self.test_size)
+                    self.storms_thresholded_, self.test_size)
 
             self.train_storms_ = self.storm_labels_.drop(
                 self.test_storms_).to_numpy()
@@ -331,7 +345,7 @@ class FeatureProcessor(BaseEstimator, TransformerMixin):
 
     def fit(self, X, y=None, target_column=0, storm_level=0, time_level=1,
             **transformer_fit_params):
-        self.target_column_ = X.columns[target_column]
+        self.target_column_ = target_column
         self.storm_level_ = storm_level
         self.time_level_ = time_level
 
@@ -366,9 +380,17 @@ class FeatureProcessor(BaseEstimator, TransformerMixin):
         return features
 
     def _transform_one_storm(self, X):
-        y_ = X[self.target_column_].to_numpy()
-        X_ = X.drop(columns=self.target_column_).to_numpy()
-
+        # Check if time has regular increments
+        if isinstance(X.index, pd.MultiIndex):
+            times = X.index.get_level_values(level=self.time_level_)
+        else:
+            times = X.index
+        if times.inferred_freq != self.time_resolution:
+            raise ValueError("X does not have regular time increments.")
+        
+        y_ = X.iloc[:,self.target_column_].to_numpy()
+        X_ = X.drop(columns=X.columns[self.target_column_]).to_numpy()
+        
         # TODO: write my own version
         p = MetaLagFeatureProcessor(
             X_, y_, self.auto_order_timesteps_,
@@ -451,10 +473,16 @@ def _pd_fit(transformer, X, y=None, **transformer_fit_params):
 
 def _pd_transform(transformer, X, y=None):
     if transformer is not None:
-        check_is_fitted(transformer)
+        if isinstance(transformer, Pipeline):
+            # Check each step of Pipeline
+            for step in transformer.steps:
+                check_is_fitted(step[1])
+        else:
+            check_is_fitted(transformer)
+            
         X_transf = transformer.transform(X)
-        X_df = pd.DataFrame(X_transf, index=X.index,
-                            columns=X.columns).astype(X.dtypes)
+        X_df = pd.DataFrame(X_transf, index=X.index)
+        # .astype(X.dtypes)
         return X_df
     else:
         return X
