@@ -2,6 +2,7 @@ from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
 from sklearn.utils import safe_mask, check_scalar
 from sklearn.utils.validation import check_is_fitted, check_X_y, check_array, check_consistent_length
 from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GroupKFold
 
 import numpy as np
 import pandas as pd
@@ -468,7 +469,7 @@ def _pd_fit(transformer, X, y=None, **transformer_fit_params):
     if transformer is not None:
         if isinstance(X, pd.Series):
             X_np = X.to_numpy().reshape(-1, 1)
-            return transformer.fit(X_np)
+            return transformer.fit(X_np, **transformer_fit_params)
         elif isinstance(X, pd.DataFrame):
             return transformer.fit(X, **transformer_fit_params)
         else:
@@ -486,10 +487,65 @@ def _pd_transform(transformer, X, y=None):
                 check_is_fitted(step[1])
         else:
             check_is_fitted(transformer)
+        
+        if isinstance(X, pd.Series):
+            # Need to reshape
+            X_transf = transformer.transform(
+                X.to_numpy().reshape(-1,1)).flatten()
+            X_transf = pd.Series(X_transf, index=X.index)
+        elif isinstance(X, pd.DataFrame):    
+            X_transf = transformer.transform(X)
+            X_transf = pd.DataFrame(X_transf, index=X.index)
+        else:
+            raise TypeError("_pd_transform is meant to only take in pandas objects as input.")
             
-        X_transf = transformer.transform(X)
-        X_df = pd.DataFrame(X_transf, index=X.index)
-        # .astype(X.dtypes)
-        return X_df
+        return X_transf
     else:
+        # Do nothing
         return X
+
+
+def prepare_geomag_data(data, storm_times_df, 
+                        test_storms=None, 
+                        min_threshold=None,
+                        test_size=1,
+                        time_resolution='5T', 
+                        target_column='sym_h',
+                        feature_columns=['bz','vx_gse','density'],
+                        storms_to_delete=[15, 69, 124],
+                        start='2000',
+                        end='2030',
+                        split_train_test=True):
+
+    if test_storms is None and min_threshold is None:
+        raise ValueError(
+            "Either test_storms or min_threshold must be specified. Specify only one and try again."
+            )
+    elif test_storms is not None and min_threshold is not None:
+        raise ValueError(
+            "test_storms and min_threshold cannot both be specified. Specify only one and try again."
+            )
+
+    # Data processing pipeline for entire dataframe
+    column_selector = DataFrameSelector([target_column]+feature_columns)
+    time_res_resampler = TimeResolutionResampler(time_resolution)
+    storms_processor = StormsProcessor(storm_times_df=storm_times_df,
+                                       storms_to_delete=storms_to_delete,start=start,
+                                       end=end)
+    
+    pipeline_transformers = [
+        ("selector", column_selector),
+        ("resampler", time_res_resampler),
+        ("processor", storms_processor)
+        ]
+    
+    if split_train_test:
+        storm_splitter = StormSplitter(test_storms=test_storms,
+                                       min_threshold=min_threshold,test_size=test_size)
+        pipeline_transformers.append(
+            ("splitter", storm_splitter))
+    
+    data_pipeline = Pipeline(pipeline_transformers)
+    processed_data = data_pipeline.fit_transform(data)
+    
+    return processed_data
