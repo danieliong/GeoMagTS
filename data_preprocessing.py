@@ -169,37 +169,24 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
         self.Vx = Vx
         self.time_resolution = time_resolution
         self.D = D
-
-    def fit(self, X, y=None, storm_level=0, time_level=1):
-
-        if self.Vx is not None and not isinstance(self.Vx, pd.Series):
-            raise TypeError("Vx must be a pd.Series (for now).")
-
-        self.storm_level_ = storm_level
-        self.time_level_ = time_level
-        
-        if X.shape[0] != self.Vx.shape[0]:
-            # Reindex Vx to have same index as X
-            self.Vx = self.Vx.reindex(X.index)
-
-        if self.Vx is not None:
-            self.propagation_in_sec_ = self.D / self.Vx.abs()
-            self.propagation_in_sec_.rename("prop_time", inplace=True)
-
-            if isinstance(self.propagation_in_sec_.index, pd.MultiIndex):
-                self.propagation_in_sec_.index.rename(names='time', level=time_level, inplace=True)
-                self.propagated_times_ = self.propagation_in_sec_.reset_index(
-                    level=time_level).apply(self._compute_propagated_time, axis=1)
-            else:
-                self.propagation_in_sec_.index.rename('time', inplace=True)
-                self.propagated_times_ = self.propagation_in_sec_.reset_index().apply(self._compute_propagated_time, axis=1)
-                
-            self.mask_ = self._get_mask(X)
-            
-        return self
-
+    
     def _compute_propagated_time(self, x):
         return x['time'] + pd.Timedelta(x['prop_time'], unit='sec').floor(freq=self.time_resolution)
+
+    def _compute_times(self, storm_level=0, time_level=1):
+        self.propagation_in_sec_ = self.D / self.Vx.abs()
+        self.propagation_in_sec_.rename("prop_time", inplace=True)
+
+        if isinstance(self.propagation_in_sec_.index, pd.MultiIndex):
+            self.propagation_in_sec_.index.rename(names='time', level=time_level, inplace=True)
+            self.propagated_times_ = self.propagation_in_sec_.reset_index(
+                level=time_level).apply(self._compute_propagated_time, axis=1)
+        else:
+            self.propagation_in_sec_.index.rename('time', inplace=True)
+            self.propagated_times_ = self.propagation_in_sec_.reset_index().apply(self._compute_propagated_time, axis=1)
+            self.propagated_times_.rename('times', inplace=True)
+            
+        return None
 
     def _get_mask(self, X):
         # Get mask of where propagated times are in X's time index
@@ -213,6 +200,26 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
         dupl_mask = self.propagated_times_.duplicated(keep='last').values
         mask = np.logical_and(proptime_in_X_mask, ~dupl_mask)
         return mask
+
+    def fit(self, X, y=None, storm_level=0, time_level=1):
+        
+        if self.Vx is None:
+            raise ValueError("Vx must be specified.")
+        elif not isinstance(self.Vx, pd.Series):
+            raise TypeError("Vx must be a pd.Series (for now).")
+
+        self.storm_level_ = storm_level
+        self.time_level_ = time_level
+        
+        if X.shape[0] != self.Vx.shape[0]:
+            # Reindex Vx to have same index as X
+            self.Vx = self.Vx.reindex(X.index)
+        
+        self._compute_times(storm_level=storm_level, 
+                            time_level=time_level)
+        self.mask_ = self._get_mask(X)
+            
+        return self
 
     def transform(self, X, y=None):
         check_is_fitted(self)
@@ -386,7 +393,7 @@ class FeatureProcessor(BaseEstimator, TransformerMixin):
         else:
             times = X.index
         if times.inferred_freq != self.time_resolution:
-            raise ValueError("X does not have regular time increments.")
+            raise ValueError("X does not have regular time increments with the specified time resolution.")
         
         y_ = X.iloc[:,self.target_column_].to_numpy()
         X_ = X.drop(columns=X.columns[self.target_column_]).to_numpy()
