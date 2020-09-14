@@ -1,6 +1,5 @@
-from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
-from sklearn.utils import safe_mask, check_scalar
-from sklearn.utils.validation import check_is_fitted, check_X_y, check_array, check_consistent_length
+from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
+from sklearn.utils.validation import check_is_fitted, check_X_y, check_array
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import GroupKFold
 
@@ -9,9 +8,7 @@ import pandas as pd
 from pandas.tseries.frequencies import to_offset
 from GeoMagTS.utils import get_storm_indices, MetaLagFeatureProcessor, shift
 import matplotlib.pyplot as plt
-
-# IDEA: Might be better to change to handling pd dataframes instead of np arrays
-
+import warnings
 
 class DataFrameSelector(BaseEstimator, TransformerMixin):
     def __init__(self, column_names=None):
@@ -36,7 +33,6 @@ class DataFrameSelector(BaseEstimator, TransformerMixin):
         else:
             return X[self.column_names]
 
-
 class TimeResolutionResampler(BaseEstimator, TransformerMixin):
     def __init__(self, time_resolution='5T', func=np.mean):
         """Changes time resolution of data
@@ -56,7 +52,6 @@ class TimeResolutionResampler(BaseEstimator, TransformerMixin):
 
     def transform(self, X, y=None):
         return X.resample(self.time_resolution).apply(self.func)
-
 
 class StormsProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
@@ -161,97 +156,6 @@ class StormsProcessor(BaseEstimator, TransformerMixin):
     def plot_storms(self):
         pass
 
-
-class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
-    def __init__(self,
-                 Vx=None,
-                 time_resolution='5T',
-                 D=1500000):
-        self.Vx = Vx
-        self.time_resolution = time_resolution
-        self.D = D
-    
-    def _compute_propagated_time(self, x):
-        return x['time'] + pd.Timedelta(x['prop_time'], unit='sec').floor(freq=self.time_resolution)
-
-    def _compute_times(self, storm_level=0, time_level=1):
-        self.propagation_in_sec_ = self.D / self.Vx.abs()
-        self.propagation_in_sec_.rename("prop_time", inplace=True)
-
-        if isinstance(self.propagation_in_sec_.index, pd.MultiIndex):
-            self.propagation_in_sec_.index.rename(names='time', level=time_level, inplace=True)
-            self.propagated_times_ = self.propagation_in_sec_.reset_index(
-                level=time_level).apply(self._compute_propagated_time, axis=1)
-        else:
-            self.propagation_in_sec_.index.rename('time', inplace=True)
-            self.propagated_times_ = self.propagation_in_sec_.reset_index().apply(self._compute_propagated_time, axis=1)
-            self.propagated_times_.rename('times', inplace=True)
-            
-        return None
-
-    def _get_mask(self, X):
-        # Get mask of where propagated times are in X's time index
-        if isinstance(X.index, pd.MultiIndex):
-            X_times = X.index.get_level_values(level=self.time_level_)
-            proptime_in_X_mask = np.in1d(self.propagated_times_, X_times)
-        else:
-            proptime_in_X_mask = np.in1d(self.propagated_times_, X.index)
-            
-        # Get mask of where propagated times are duplicated
-        dupl_mask = self.propagated_times_.duplicated(keep='last').values
-        mask = np.logical_and(proptime_in_X_mask, ~dupl_mask)
-        return mask
-
-    def fit(self, X, y=None, storm_level=0, time_level=1):
-        
-        if self.Vx is None:
-            raise ValueError("Vx must be specified.")
-        elif not isinstance(self.Vx, pd.Series):
-            raise TypeError("Vx must be a pd.Series (for now).")
-
-        self.storm_level_ = storm_level
-        self.time_level_ = time_level
-        
-        if X.shape[0] != self.Vx.shape[0]:
-            # Reindex Vx to have same index as X
-            self.Vx = self.Vx.reindex(X.index)
-        
-        self._compute_times(storm_level=storm_level, 
-                            time_level=time_level)
-        self.mask_ = self._get_mask(X)
-            
-        return self
-
-    def transform(self, X, y=None):
-        check_is_fitted(self)
-
-        if self.Vx is not None:
-            if isinstance(X.index, pd.MultiIndex):
-                storms = X.index.get_level_values(level=self.storm_level_)
-                return X.reindex(
-                    [storms[self.mask_], self.propagated_times_[self.mask_]]
-                    )
-            else:
-                return X.reindex(self.propagated_times_[self.mask_])
-        else:
-            return X
-    
-    # def shift(self, X, y=None):
-    #     check_is_fitted(self)
-    #     # TODO: Handle MultiIndex case
-        
-    #     def _get_shifted_time(t):
-    #         return t + pd.Timedelta(self.propagation_in_sec_[t], unit='sec').floor(freq=self.time_resolution)
-        
-    #     if self.Vx is not None:
-    #         X_shifted = pd.Series(
-    #             [X[_get_shifted_time(t)] for t in X.index], 
-    #             index=X.index)
-    #         return X_shifted
-    #     else:
-    #         return X
-
-
 class StormSplitter(BaseEstimator, TransformerMixin):
     def __init__(self,
                  test_storms=None,
@@ -334,176 +238,6 @@ class StormSplitter(BaseEstimator, TransformerMixin):
             return self.train_storms_, self.test_storms_
         else:
             return self.train_storms, self.test_storms_
-
-
-class FeatureProcessor(BaseEstimator, TransformerMixin):
-    def __init__(self,
-                 auto_order=60,
-                 exog_order=60,
-                 time_resolution='5T',
-                 transformer=None,
-                 fit_transformer=True,
-                 **transformer_params):
-        self.auto_order = auto_order
-        self.exog_order = exog_order
-        self.time_resolution = time_resolution
-        self.transformer = transformer.set_params(**transformer_params)
-        self.fit_transformer = fit_transformer
-        self.transformer_params = transformer_params
-
-    def fit(self, X, y=None, target_column=0, storm_level=0, time_level=1,
-            **transformer_fit_params):
-        self.target_column_ = target_column
-        self.storm_level_ = storm_level
-        self.time_level_ = time_level
-
-        # convert auto_order, exog_order to time steps
-        time_res_minutes = to_offset(self.time_resolution).delta.seconds / 60
-        self.auto_order_timesteps_ = np.rint(
-            self.auto_order / time_res_minutes).astype(int)
-        self.exog_order_timesteps_ = np.rint(
-            self.exog_order / time_res_minutes).astype(int)
-
-        if self.transformer is not None:
-            self.transformer.set_params(**self.transformer_params)
-
-            if self.fit_transformer:
-                self.transformer = _pd_fit(
-                    self.transformer, X, **transformer_fit_params)
-
-        return self
-
-    def transform(self, X, y=None):
-        check_is_fitted(self)
-
-        X = _pd_transform(self.transformer, X)
-        if isinstance(X.index, pd.MultiIndex):
-            features = X.groupby(level=self.storm_level_).apply(
-                self._transform_one_storm)
-            features = np.vstack(features)
-        else:
-            features = self._transform_one_storm(X)
-        
-        features = check_array(features, force_all_finite='allow-nan')
-        return features
-
-    def _transform_one_storm(self, X):
-        # Check if time has regular increments
-        if isinstance(X.index, pd.MultiIndex):
-            times = X.index.get_level_values(level=self.time_level_)
-        else:
-            times = X.index
-        if times.inferred_freq != self.time_resolution:
-            raise ValueError("X does not have regular time increments with the specified time resolution.")
-        
-        y_ = X.iloc[:,self.target_column_].to_numpy()
-        X_ = X.drop(columns=X.columns[self.target_column_]).to_numpy()
-        
-        # TODO: write my own version
-        p = MetaLagFeatureProcessor(
-            X_, y_, self.auto_order_timesteps_,
-            [self.exog_order_timesteps_]*X_.shape[1],
-            [0]*X_.shape[1])
-        lagged_features = p.generate_lag_features()
-        return lagged_features
-        
-
-class TargetProcessor(BaseEstimator, TransformerMixin):
-    def __init__(self,
-                 pred_step=0,
-                 time_resolution='5T',
-                 #  propagate=True,
-                 #  Vx=None,
-                 #  D=1500000,
-                 transformer=None,
-                 **transformer_params):
-        self.pred_step = pred_step
-        self.time_resolution = time_resolution
-        # self.propagate = propagate
-        # self.Vx = Vx
-        # self.D = D
-        self.transformer = transformer
-        self.transformer_params = transformer_params
-
-    def fit(self, X, y=None, storm_level=0, time_level=1,
-            **transformer_fit_params):
-
-        self.storm_level_ = storm_level
-        self.time_level_ = time_level
-
-        # Transform X if transformer is provided
-        if self.transformer is not None:
-            self.transformer.set_params(**self.transformer_params)
-            self.transformer = _pd_fit(
-                self.transformer, X, **transformer_fit_params)
-
-        # Get future times to predict
-        self.times_to_predict_ = X.index.get_level_values(
-            level=self.time_level_) + pd.Timedelta(minutes=self.pred_step)
-        self.mask_ = self._get_mask(X)
-        
-        return self
-
-    def transform(self, X, y=None):
-        check_is_fitted(self)
-
-        X_ = _pd_transform(self.transformer, X)
-        
-        storms = X.index.get_level_values(level=self.storm_level_)
-        X_ = X.reindex(
-            [storms, self.times_to_predict_]
-            )
-
-        return X_                
-
-    def _get_mask(self, X):
-        X_times = X.index.get_level_values(level=self.time_level_)
-
-        # Get mask of where times_to_predict are in X's time index
-        mask = np.in1d(self.times_to_predict_, X_times)
-
-        return mask
-
-
-def _pd_fit(transformer, X, y=None, **transformer_fit_params):
-    if transformer is not None:
-        if isinstance(X, pd.Series):
-            X_np = X.to_numpy().reshape(-1, 1)
-            return transformer.fit(X_np, **transformer_fit_params)
-        elif isinstance(X, pd.DataFrame):
-            return transformer.fit(X, **transformer_fit_params)
-        else:
-            raise TypeError(
-                "_pd_fit is meant to only take in pandas objects as input.")
-    else:
-        return None
-
-
-def _pd_transform(transformer, X, y=None):
-    if transformer is not None:
-        if isinstance(transformer, Pipeline):
-            # Check each step of Pipeline
-            for step in transformer.steps:
-                check_is_fitted(step[1])
-        else:
-            check_is_fitted(transformer)
-        
-        if isinstance(X, pd.Series):
-            # Need to reshape
-            X_transf = transformer.transform(
-                X.to_numpy().reshape(-1,1)).flatten()
-            X_transf = pd.Series(X_transf, index=X.index)
-        elif isinstance(X, pd.DataFrame):    
-            X_transf = transformer.transform(X)
-            X_transf = pd.DataFrame(X_transf, index=X.index)
-        else:
-            raise TypeError("_pd_transform is meant to only take in pandas objects as input.")
-            
-        return X_transf
-    else:
-        # Do nothing
-        return X
-
 
 def prepare_geomag_data(data, storm_times_df, 
                         test_storms=None, 
