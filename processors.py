@@ -1,10 +1,11 @@
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted, check_X_y, check_array
+from sklearn.pipeline import Pipeline
 
 import numpy as np
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
-from GeoMagTS.utils import MetaLagFeatureProcessor
+from GeoMagTS.utils import MetaLagFeatureProcessor, _get_NA_mask
 import warnings
 
 class GeoMagARXProcessor():
@@ -15,20 +16,26 @@ class GeoMagARXProcessor():
                  transformer_X=None,
                  transformer_y=None,
                  propagate=True,
+                 vx_colname='vx_gse',
                  time_resolution='5T',
-                 D=1500000):
+                 D=1500000,
+                 storm_level=0,
+                 time_level=1):
         self.auto_order = auto_order
         self.exog_order = exog_order
         self.pred_step = pred_step
         self.transformer_X = transformer_X
         self.transformer_y = transformer_y
         self.propagate = propagate
+        self.vx_colname = vx_colname
         self.time_resolution = time_resolution
         self.D = D
+        self.storm_level = storm_level
+        self.time_level = time_level
         self.processor_fitted_ = False
 
     def check_data(self, X, y=None, fit=True, check_multi_index=True,
-                   check_vx_col=True, check_same_cols=False, storm_level=None, time_level=None, **sklearn_check_params):
+                   check_vx_col=True, check_same_cols=False, **sklearn_check_params):
 
         # Check without converting to np arrays
         _ = check_X_y(X, y, y_numeric=True, **sklearn_check_params)
@@ -45,20 +52,8 @@ class GeoMagARXProcessor():
                     "X.index must have at least 2 levels corresponding to storm and times if it is a MultiIndex.")
 
             # Get mask for removing duplicates
-            try:
-                dupl_mask_ = X.index.get_level_values(
-                    level=self.time_level_).duplicated(keep='last')
-            except AttributeError:
-                warnings.warn("self.time_level_ is not defined.")
-
-                if time_level is not None:
-                    warnings.warn(
-                        "time_level is specified and will be used in removing duplicate times.")
-                    dupl_mask_ = X.index.get_level_values(
-                        level=time_level).duplicated(keep='last')
-                else:
-                    raise ValueError(
-                        "Either self.time_level_ or time_level must be defined if X has a MultiIndex.")
+            dupl_mask_ = X.index.get_level_values(
+                level=self.time_level).duplicated(keep='last')
 
         elif check_multi_index:
             raise TypeError("X must have a MultiIndex (for now).")
@@ -78,13 +73,13 @@ class GeoMagARXProcessor():
                 "Inputs have duplicated indices. Only one of each row with duplicated indices will be kept.")
 
         # Check if vx_colname is in X
-        if check_vx_col and self.vx_colname_ not in X.columns:
+        if check_vx_col and self.vx_colname not in X.columns:
             raise ValueError("X does not have column "+self.vx_colname_+".")
 
         if check_same_cols:
             if not X.columns.equals(self.features_):
                 raise ValueError(
-                    "X must have the same columns as the X used for training.")
+                    "X must have the same columns as the X used for fitting.")
 
         if y is not None:
             if not isinstance(y, (pd.Series, pd.DataFrame)):
@@ -100,11 +95,21 @@ class GeoMagARXProcessor():
 
         return X, y
 
-    def process_data(self, X, y=None, fit=True, check_data=True,
-                     remove_NA=True, **check_params):
+    def process_data(self, X, y=None,  
+                     fit=True, 
+                     check_data=True,
+                     remove_NA=True, 
+                     **check_params):
+
+        if fit:
+            self.features_ = X.columns
+        elif not self.processor_fitted_:
+            raise NotProcessedError(self)
 
         if check_data:
-            X, y = self._check_data(X, y, fit=fit, **check_params)
+            X, y = self.check_data(
+                X, y, fit=fit, check_vx_col=self.propagate, 
+                check_same_cols=(not fit), **check_params)
 
         if y is not None:
             data_ = pd.concat([y, X], axis=1)
@@ -116,7 +121,7 @@ class GeoMagARXProcessor():
         if fit:
             # - Set feature processor as attribute and fit it
             # - Set target processor as attribute, fit and transform y
-
+            
             # Fit feature processor
             self.feature_processor_ = FeatureProcessor(
                 auto_order=self.auto_order,
@@ -126,8 +131,8 @@ class GeoMagARXProcessor():
             self.feature_processor_.fit(
                 data_,
                 target_column=0,
-                storm_level=self.storm_level_,
-                time_level=self.time_level_)
+                storm_level=self.storm_level,
+                time_level=self.time_level)
 
             # Fit target processor and transform training targets
             self.target_processor_ = TargetProcessor(
@@ -136,25 +141,22 @@ class GeoMagARXProcessor():
                 transformer=self.transformer_y
             )
             y_ = self.target_processor_.fit_transform(
-                y, storm_level=self.storm_level_, time_level=self.time_level_)
+                y, storm_level=self.storm_level, time_level=self.time_level)
 
             # Fit propagation time processor and transform training targets
             if self.propagate:
                 self.propagation_time_processor_ = PropagationTimeProcessor(
-                    Vx=X[self.vx_colname_],
+                    Vx=X[self.vx_colname],
                     time_resolution=self.time_resolution,
                     D=self.D)
                 y_ = self.propagation_time_processor_.fit_transform(
-                    y_, time_level=self.time_level_)
+                    y_, time_level=self.time_level)
             else:
                 self.propagation_time_processor_ = None
 
             # BUG: lengths of X_, y_ differ when pred_step > 0
 
             self.processor_fitted_ = True
-
-        elif not self.processor_fitted_:
-            raise NotProcessedError(self)
 
         # Use feature_processor that was fit previously.
         X_ = self.feature_processor_.transform(data_)
@@ -164,7 +166,7 @@ class GeoMagARXProcessor():
             target_mask = self.target_processor_.mask_
             if self.propagate:
                 target_mask = np.logical_and(
-                    target_mask, self.propagation_time_processor.mask_)
+                    target_mask, self.propagation_time_processor_.mask_)
             X_ = X_[target_mask]
 
             if remove_NA:
@@ -198,7 +200,8 @@ class FeatureProcessor(BaseEstimator, TransformerMixin):
             **transformer_fit_params):
 
         if self.transformer is not None:
-            self.transformer = self.transformer.set_params(**transformer_params)
+            self.transformer = self.transformer.set_params(
+                **self.transformer_params)
 
         self.target_column_ = target_column
         self.storm_level_ = storm_level
