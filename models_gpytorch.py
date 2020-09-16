@@ -62,34 +62,55 @@ class MLPKernel(gpytorch.kernels.Kernel):
         set.initialize(raw_b=self.positive_constraint.inverse_transform(b))
     
     def forward(self, x, y, **params):
-        # Convert to matrix so that it can be added to matrices 
-        ones = lazify(torch.ones(*self.batch_shape, x.shape[0], x.shape[0]))
-        b_ = lazify(self.b * ones)
+        one = torch.Tensor([1])
         
-        xTx = RootLazyTensor(x)
-        yTy = RootLazyTensor(y)
-        
-        if x.size() == y.size() and torch.equal(x, y):
-            xTy = RootLazyTensor(x)
+        if x.dim() == 2 and y.dim() == 2:
+            numer = torch.addmm(self.b, x, y.transpose(-2,-1))
         else:
-            xTy = MatmulLazyTensor(x, y.transpose(-2,-1))
+            numer = (self.w * x.matmul(y.transpose(-2, -1))) + self.b
         
-        numer = (self.w * xTy) + b_
+        norm_sq_x = x.matmul(x.transpose(-2,-1)).diag()
+        if x.size() == y.size() and torch.equal(x, y):
+            denom = (self.w * norm_sq_x.ger(norm_sq_x)) + self.b + one
+        else:
+            norm_sq_y = y.matmul(y.transpose(-2,-1)).diag()
+            denom = torch.ger(
+                (self.w*norm_sq_x)+self.b+one,
+                (self.w*norm_sq_y)+self.b+one
+            ).sqrt()
         
-        denom_sq = MulLazyTensor(
-            (self.w*xTx)+ b_+ones,
-            (self.w*yTy)+b_+ones
-            )
-        # NOTE: cant take element-wise square root of LazyTensor
-    
-        res = torch.asin(
-            numer.evaluate().div(
-                denom_sq.evaluate().sqrt()
-                )
-            )
-        # If have time, create LazyTensor that can take element-wise square root
-        return res
-
+        res = torch.asin(numer.div(denom))
+        return res 
+        
+    # def forward(self, x, y, **params):
+    #     # Convert to matrix so that it can be added to matrices 
+    #     ones_ = lazify(torch.ones(*self.batch_shape, x.shape[0], x.shape[0]))
+    #     b_ = lazify(self.b * ones_)
+    #     xTx = RootLazyTensor(x)
+        
+    #     if x.size() == y.size() and torch.equal(x, y):
+    #         numer = (self.w * xTx) + b_
+    #         denom = 
+    #         # denom = numer + ones_
+    #         res = torch.asin(numer.evaluate().div(denom.evaluate().abs()))
+    #     else:
+    #         yTy = RootLazyTensor(y)
+    #         xTy = MatmulLazyTensor(x, y.transpose(-2,-1))
+    #         numer = (self.w * xTy) + b_
+    #         denom_sq = MulLazyTensor(
+    #             (self.w*xTx)+ b_+ones_,
+    #             (self.w*yTy)+b_+ones_
+    #             )
+    #         res = torch.asin(
+    #             numer.evaluate().div(
+    #                 denom_sq.evaluate().sqrt()
+    #                 )
+    #             )
+    #         # NOTE: cant take element-wise square root of LazyTensor
+    #         # If have time, create LazyTensor that can take element-wise square
+    #         # root
+    #     return res
+        
 class StudentTKernel(gpytorch.kernels.Kernel):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
