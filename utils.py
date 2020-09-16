@@ -7,6 +7,7 @@ from sklearn.utils import safe_mask
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.utils.validation import check_is_fitted
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import mean_squared_error
 from numpy.random import randint
 from collections import deque
 
@@ -24,21 +25,37 @@ def get_storm_indices(data, stormtimes_df, include_storms, time_resolution='5T')
         return [np.where(data.reset_index(level=0)['index'].isin(times))[0] for times in stormtimes_list]
 
 
-def _get_NA_mask(X, y=None):
+def _get_NA_mask(X, y=None, mask_y=False):    
     if y is None:
-        return ~safe_mask(X, np.isnan(X).any(axis=1))
-    else:
+        mask_y = False
+    
+    if mask_y:
         if isinstance(y, (pd.Series, pd.DataFrame)):
             y_ = y.to_numpy()
-            data_ = np.concatenate([y_.reshape(-1, 1), X], axis=1)
+            data_ = np.concatenate([y_.reshape(-1,1), X], axis=1)
         else:
             data_ = np.concatenate([y.reshape(-1, 1), X], axis=1)
+    else:
+        data_ = X
     
-        mask = ~np.isnan(data_).any(axis=1)
-        # Check mask
-        mask = safe_mask(X, mask)
-        mask = safe_mask(y, mask)
-        return mask
+    mask = ~np.isnan(data_).any(axis=1)
+    return mask
+
+def mse_masked(y, ypred, squared=True, round=False, copy=True, **kwargs):
+    y_ = y
+    ypred_ = ypred
+    if copy:
+        y_ = y_.copy()
+        ypred_ = ypred.copy()
+    
+    y_ = y_.reindex(ypred.index)
+    nan_mask = ~np.isnan(y_)
+    mse = mean_squared_error(y_[nan_mask], ypred_[nan_mask],
+                            squared=squared, **kwargs)
+    if round:
+        mse = np.around(mse, decimals=3)
+
+    return mse
 
 def create_narx_model(n_hidden, learning_rate,
                       activation_hidden='tanh',
