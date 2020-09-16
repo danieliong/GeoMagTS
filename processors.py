@@ -209,7 +209,7 @@ class GeoMagARXProcessor():
             # BUG: lengths of X_, y_ differ when pred_step > 0
 
             self.processor_fitted_ = True
-        elif y is not None:
+        elif y is not None and self.transformer_y is not None:
             # Don't transform y_ 
             y_ = self.transformer_y.transform(
                 y_.to_numpy().reshape(-1,1)).flatten()
@@ -242,7 +242,6 @@ class GeoMagARXProcessor():
                 ypred_ = ypred_.copy()
             elif isinstance(ypred_, torch.Tensor):
                 ypred_ = ypred_.clone()
-        
         
         if self.transformer_y is not None and inverse_transform_y:
             check_is_fitted(self.target_processor_.transformer)
@@ -653,7 +652,7 @@ class TargetProcessor(BaseEstimator, TransformerMixin):
         X_ = _pd_transform(self.transformer, X)
 
         storms = X.index.get_level_values(level=self.storm_level_)
-        X_ = X.reindex(
+        X_ = X_.reindex(
             [storms, self.times_to_predict_]
         )
 
