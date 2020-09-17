@@ -14,8 +14,9 @@ from sklearn.metrics import mean_squared_error, make_scorer
 from sklearn.pipeline import Pipeline
 from pandas.tseries.frequencies import to_offset
 from sklearn.preprocessing import PolynomialFeatures
+from scipy.stats import norm
 
-from GeoMagTS.processors import GeoMagARXProcessor
+from GeoMagTS.processors import GeoMagARXProcessor, NotProcessedError
 from GeoMagTS.utils import _get_NA_mask
 
 # NOTE: Converting to pandas from np slowed down the code significantly
@@ -30,15 +31,21 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
                  transformer_y=None,
                  propagate=True,
                  time_resolution='5T',
-                 D=1500000, **estimator_params):
+                 D=1500000, 
+                 storm_level=0,
+                 time_level=1,
+                 save_lazy_data=True,
+                 **estimator_params):
         super().__init__(
-            exog_order=60,
-            pred_step=0,
+            exog_order=exog_order,
+            pred_step=pred_step,
             transformer_X=None,
             transformer_y=None,
             propagate=True,
-            time_resolution='5T',
-            D=1500000)
+            time_resolution=time_resolution,
+            D=D, storm_level=storm_level,
+            time_level=time_level,
+            save_lazy_data=save_lazy_data)
         
         self.base_estimator = base_estimator.set_params(**estimator_params)
         self.estimator_params = estimator_params
@@ -57,7 +64,7 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
         # self.base_estimator = self.base_estimator.set_params(
         #     **self.estimator_params)
 
-        target, features = self.process_data(X, y, fit=True)
+        features, target = self.process_data(X, y, fit=True)
         
         # Get number of auto order, exog order steps
         time_res_minutes = to_offset(self.time_resolution).delta.seconds/60
@@ -74,7 +81,7 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
             self.base_estimator_fitted_ = clone(self.base_estimator)
 
         # Fit base estimator 
-        self.base_estimator_fitted_.fit(target, features, **fit_args)
+        self.base_estimator_fitted_.fit(features, target, **fit_args)
         
         return self
     
@@ -83,10 +90,9 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
         
         check_is_fitted(self)
         
-        X, y = self.check_data(X, y, fit=False, check_multi_index=False, check_vx_col=False, check_same_cols=True)
+        # X, y = self.check_data(X, y, fit=False, check_multi_index=False, check_vx_col=False, check_same_cols=True)
         
         X_, y = self.process_data(X, y, fit=False, 
-                                  check_data=False,
                                   remove_NA=False)
 
         nan_mask = _get_NA_mask(X_)
@@ -99,154 +105,6 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
             ypred, Vx=X[self.vx_colname_][nan_mask])
 
         return ypred
-    
-    def _predict_persistence(self, X, y):
-        y_pred = y.shift(periods=self.pred_step, freq='T')
-        if self.propagate:
-            pers_prop_time_processor = PropagationTimeProcessor(
-                Vx=X[self.vx_colname_], time_resolution=self.time_resolution,
-                D=self.D)
-            pers_prop_time_processor = pers_prop_time_processor.fit(y_pred)
-            y_pred = pd.Series(y_pred.values, 
-                index = pers_prop_time_processor.propagated_times_.values)
-            
-            # y_pred = pers_prop_time_processor.shift(y_pred)
-            
-        return y_pred
-
-    def _plot_one_storm(
-            self, X, y, storm_idx, display_info=False,
-            figsize=(10, 7), plot_persistence=True, model_name=None, 
-            sw_to_plot=None, **plot_params):
-
-        if sw_to_plot is not None:
-            n_sw_to_plot = len(sw_to_plot)
-            fig, ax = plt.subplots(nrows=n_sw_to_plot+1, 
-                                   ncols=1,
-                                   sharex=True,
-                                   figsize=figsize,
-                                   gridspec_kw={
-                                       'height_ratios':[4]+[1]*n_sw_to_plot},
-                                   **plot_params)
-            ax0 = ax[0]
-        else:
-            fig, ax = plt.subplots(sharex=True,
-                                   figsize=figsize,
-                                   **plot_params)
-            ax0 = ax
-        
-        ### Plot truth
-        ax0.plot(y, label='Truth', color='black', linewidth=0.5)
-        
-        ### Plot predictions
-        ypred = self.predict(X, y)
-        rmse = self.score(X, y, negative=False, round=True, decimals=2)
-    
-        # Get prediction label
-        pred_label = ''
-        if self.propagate:
-            pred_label = pred_label + 'Propagated '
-        if self.pred_step > 0:
-            pred_label = pred_label + str(self.pred_step) + 'min. ahead'
-        pred_label = pred_label + 'prediction (RMSE: '+ str(rmse)+')'
-        
-        ax0.plot(ypred, label=pred_label, color='red', linewidth=0.5)
-
-        if plot_persistence:
-            y_persistence = self._predict_persistence(X, y)
-            rmse_persistence = self.score(
-                X, y, negative=False, persistence=True, squared=False, round=True, decimals=2)
-            
-            persistence_label = 'Persistence (RMSE: '+str(rmse_persistence)+')'
-            ax0.plot(y_persistence, label=persistence_label,
-                    color='blue', linestyle='--', linewidth=0.5)
-
-        ax0.legend()
-        # Adjust time scale
-        locator = mdates.AutoDateLocator(minticks=15)
-        formatter = mdates.ConciseDateFormatter(locator)
-        ax0.xaxis.set_major_locator(locator)
-        ax0.xaxis.set_major_formatter(formatter)
-
-        if display_info:
-            info = 'Storm #'+str(storm_idx)+": " + \
-            'time_resolution='+str(self.time_resolution)+', '+ \
-            'auto_order='+str(self.auto_order)+', ' + \
-            'exog_order='+str(self.exog_order)+' (in min.)'
-            if model_name is not None:
-                info = info + ', ' + model_name 
-            
-            if len(self.estimator_params) != 0:
-                info = info + ' ('
-                i = 0
-                for param, value in self.estimator_params.items():
-                    info = info + param + '=' + str(value)
-                    if i != len(self.estimator_params)-1:
-                        info = info + ', '
-                        i = i + 1
-                info = info + ')'
-            ax0.set_title(info)
-        
-        if sw_to_plot is not None:
-            
-            for i in range(n_sw_to_plot):
-                ax[i+1].plot(X[sw_to_plot[i]], label=sw_to_plot[i], 
-                        color='black', linewidth=0.5)
-                ax[i+1].legend()
-                ax[i+1].xaxis.set_major_locator(locator)
-                ax[i+1].xaxis.set_major_formatter(formatter)
-                       
-            fig.tight_layout()
-        return fig, ax
-
-    # TODO: Add interactive plot
-    def plot_predict(self, X, y,
-                     storms_to_plot=None,
-                     display_info=False,
-                     figsize=(15, 10),
-                     save=True,
-                     file_name='prediction_plot.pdf',
-                     plot_persistence=True,
-                     model_name=None,
-                     sw_to_plot=None,
-                     **plot_params):
-        check_is_fitted(self)
-
-        storms_to_plot = y.index.unique(level=self.storm_level_)
-        if storms_to_plot is not None:
-            storms_to_plot = storms_to_plot.intersection(storms_to_plot)
-
-        if len(storms_to_plot) == 0:
-            warnings.warn("No storms to plot.")
-            # End function
-            return None
-        elif len(storms_to_plot) > 1:
-            idx = pd.IndexSlice
-            X = X.loc[idx[storms_to_plot, :], :]
-            y = y.loc[idx[storms_to_plot, :]]
-
-        ypred = self.predict(X, y)
-
-        if save:
-            pdf = PdfPages(file_name)
-
-        for storm in storms_to_plot:
-
-            # rmse = self.score(X.loc[storm], y.loc[storm])
-            fig, ax = self._plot_one_storm(
-                X.loc[storm], y.loc[storm],
-                storm_idx=storm, display_info=display_info, 
-                figsize=figsize, plot_persistence=plot_persistence,
-                model_name=model_name, sw_to_plot=sw_to_plot, **plot_params)
-
-            if save:
-                pdf.savefig(fig)
-            else:
-                plt.show()
-
-        if save:
-            pdf.close()
-        return None
 
     def score(self, X, y, negative=True, persistence=False, squared=False, 
               round=False, **round_params):
@@ -299,7 +157,67 @@ class GeoMagLinearARX(GeoMagARXRegressor):
             transformer_y=transformer_y,
             **params)
 
+    def compute_prediction_se(self, X, y=None, squared=False):
+        
+        if not self.processor_fitted_:
+            raise NotProcessedError(self)
+        elif not self.save_lazy_data:
+            raise ValueError("self.save_lazy_data must be True to compute prediction standard errors.")
+        
+        test_features, y = self.process_data(X, y, fit=False,
+                                             remove_NA=False)
+
+        nan_mask = _get_NA_mask(test_features)
+        test_features = test_features[nan_mask]
+        
+        n,p = self.train_features_.shape
+        fitted_vals = self.compute_fitted_values()
+        diff = self.train_target_.evaluate() - fitted_vals
+        sigma_sq = diff.dot(diff) / (n - p)
+        inv_XTX = np.linalg.inv(
+            np.matmul(
+                self.train_features_.evaluate().transpose(),
+                self.train_features_.evaluate()
+            )
+        )
+        
+        covar = sigma_sq * (
+            test_features.dot(inv_XTX.dot(test_features.transpose())) + \
+            np.eye(test_features.shape[0]))
+        if squared:
+            return np.diag(covar)
+        else:
+            return np.sqrt(np.diag(covar)) 
+    
+    def compute_fitted_values(self):
+        if not self.processor_fitted_:
+            raise NotProcessedError(self)
+        elif not self.save_lazy_data:
+            raise ValueError(
+                "self.save_lazy_data must be True to compute fitted values.")
+        
+        coef = self.base_estimator_fitted_.coef_
+        fitted_vals = np.matmul(
+            self.train_features_.evaluate(), 
+            self.base_estimator_fitted_.coef_
+            )
+        return fitted_vals
+    
+    def compute_prediction_interval(self, X, y=None, level=.95):
+        
+        ypred = self.predict(X, y)
+        se = self.compute_prediction_se(X, y)
+    
+        lower_z, upper_z = norm.interval(level)
+        res = {'mean': ypred, 
+               'lower': ypred + (lower_z * se),
+               'upper': ypred + (upper_z * se)
+               }
+        return res 
+        
+
     def get_coef_df(self, include_interactions=False):
+        
         check_is_fitted(self)
         
         ar_coef_names = np.array(
