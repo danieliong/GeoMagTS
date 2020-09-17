@@ -264,30 +264,35 @@ class GeoMagARXProcessor():
         #         ypred_ = ypred_.numpy()
 
         # TODO: Find more efficient way to do this
-        if isinstance(Vx.index, pd.MultiIndex):
-            times = Vx.index.get_level_values(level=self.time_level)
-            # storms = Vx.index.get_level_values(level=self.storm_level)
-            shifted_times = times + pd.Timedelta(minutes=self.pred_step)
-        else:
-            shifted_times = Vx.index + pd.Timedelta(minutes=self.pred_step)
+        # if isinstance(Vx.index, pd.MultiIndex):
+        #     times = Vx.index.get_level_values(level=self.time_level)
+        #     # storms = Vx.index.get_level_values(level=self.storm_level)
+        #     shifted_times = times + pd.Timedelta(minutes=self.pred_step)
+        # else:
+        #     shifted_times = Vx.index + pd.Timedelta(minutes=self.pred_step)
 
-        # Vx_ = Vx
-        # if copy:
-        #     if isinstance(Vx_, (np.ndarray, pd.Series, pd.DataFrame)):
-        #         Vx_ = Vx_.copy()
-        #     elif isinstance(Vx_, torch.Tensor):
-        #         Vx_ = Vx_.clone()
-        # Vx_ = Vx_.reindex(shifted_times, level=self.time_level)
+        Vx_ = Vx
+        if copy:
+            if isinstance(Vx_, (np.ndarray, pd.Series, pd.DataFrame)):
+                Vx_ = Vx_.copy()
+            elif isinstance(Vx_, torch.Tensor):
+                Vx_ = Vx_.clone()
+        
+        test_target_processor = TargetProcessor(
+            pred_step=self.pred_step,
+            time_resolution=self.time_resolution)
+        Vx_ = test_target_processor.fit_transform(
+            Vx_, storm_level=self.storm_level, time_level=self.time_level)
             
         test_prop_time_processor = PropagationTimeProcessor(
-            Vx=Vx.reindex(shifted_times, level=self.time_level),
+            Vx=Vx_,
             time_resolution=self.time_resolution,
             D=self.D)
         test_prop_time_processor._compute_times(
             storm_level=self.storm_level,
             time_level=self.time_level)
-        pred_times = test_prop_time_processor.propagated_times_
-        mask = test_prop_time_processor._get_mask(Vx)
+        mask = test_prop_time_processor._get_mask(Vx_)
+        pred_times = test_prop_time_processor.propagated_times_[mask]
 
         if isinstance(Vx.index, pd.MultiIndex):
             ypred_ = pd.Series(ypred_[mask], 
@@ -380,7 +385,8 @@ class GeoMagARXProcessor():
                  label=pred_label, color='red', linewidth=0.5)
 
         if lower is not None and upper is not None:
-            ax.fill_between(lower.index.get_level_values(level=self.time_level),
+            ax0.fill_between(
+                lower.index.get_level_values(level=self.time_level),
                             lower[storm_idx], upper[storm_idx], 
                             alpha=0.25, color='red')
 
