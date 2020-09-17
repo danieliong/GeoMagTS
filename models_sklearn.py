@@ -39,9 +39,9 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
         super().__init__(
             exog_order=exog_order,
             pred_step=pred_step,
-            transformer_X=None,
-            transformer_y=None,
-            propagate=True,
+            transformer_X=transformer_X,
+            transformer_y=transformer_y,
+            propagate=propagate,
             time_resolution=time_resolution,
             D=D, storm_level=storm_level,
             time_level=time_level,
@@ -82,6 +82,7 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
 
         # Fit base estimator 
         self.base_estimator_fitted_.fit(features, target, **fit_args)
+        self.coef_ = self.base_estimator_fitted_.coef_
         
         return self
     
@@ -156,30 +157,51 @@ class GeoMagLinearARX(GeoMagARXRegressor):
             transformer_X=transformer_X,
             transformer_y=transformer_y,
             **params)
-
-    def compute_prediction_se(self, X, y=None, squared=False):
-        
+    
+    
+    def compute_sigma_sq(self):
         if not self.processor_fitted_:
             raise NotProcessedError(self)
         elif not self.save_lazy_data:
-            raise ValueError("self.save_lazy_data must be True to compute prediction standard errors.")
-        
-        test_features, y = self.process_data(X, y, fit=False,
-                                             remove_NA=False)
-
-        nan_mask = _get_NA_mask(test_features)
-        test_features = test_features[nan_mask]
-        
-        n,p = self.train_features_.shape
+            raise ValueError(
+                "self.save_lazy_data must be True to compute fitted values.")
+            
+        n, p = self.train_features_.shape
         fitted_vals = self.compute_fitted_values()
         diff = self.train_target_.evaluate() - fitted_vals
         sigma_sq = diff.dot(diff) / (n - p)
+        return sigma_sq
+    
+    def compute_se(self, squared=False):
+        sigma_sq = self.compute_sigma_sq()
         inv_XTX = np.linalg.inv(
             np.matmul(
                 self.train_features_.evaluate().transpose(),
                 self.train_features_.evaluate()
             )
         )
+        
+        mse = np.diag(sigma_sq * inv_XTX)
+        if squared:
+            return mse
+        else:
+             return np.sqrt(mse)
+
+    def compute_prediction_se(self, X, y=None, squared=False):
+    
+        sigma_sq = self.compute_sigma_sq()
+        
+        inv_XTX = np.linalg.inv(
+            np.matmul(
+                self.train_features_.evaluate().transpose(),
+                self.train_features_.evaluate()
+            )
+        )
+        
+        test_features, y = self.process_data(X, y, fit=False,
+                                             remove_NA=False)
+        self.se_mask_ = _get_NA_mask(test_features)
+        test_features = test_features[self.se_mask_]
         
         covar = sigma_sq * (
             test_features.dot(inv_XTX.dot(test_features.transpose())) + \
@@ -204,43 +226,60 @@ class GeoMagLinearARX(GeoMagARXRegressor):
         return fitted_vals
     
     def compute_prediction_interval(self, X, y=None, level=.95):
+        from scipy.stats import t
         
         ypred = self.predict(X, y)
         se = self.compute_prediction_se(X, y)
-    
-        lower_z, upper_z = norm.interval(level)
+        se = self.process_predictions(
+            se, Vx=X[self.vx_colname][self.se_mask_], 
+            inverse_transform_y=False)
+        
+        n, p = self.train_features_.shape
+        
+        lower_z, upper_z = t.interval(level, n-p)
         res = {'mean': ypred, 
                'lower': ypred + (lower_z * se),
                'upper': ypred + (upper_z * se)
                }
-        return res 
-        
+        return res
 
-    def get_coef_df(self, include_interactions=False):
+    def _compute_pval(self):
+        from scipy.stats import t 
+        if not self.processor_fitted_:
+            raise NotProcessedError(self)
+        elif not self.save_lazy_data:
+            raise ValueError(
+                "self.save_lazy_data must be True to compute fitted values.")
         
-        check_is_fitted(self)
+        n, p = self.train_features_.shape
+        df = n - p
         
-        ar_coef_names = np.array(
+        se = self.compute_se()
+        coef = self.base_estimator_fitted_.coef_
+        test_stat = np.abs(coef) / se 
+        pval = 2*t.sf(test_stat, df)
+        return pval
+    
+    def _format_df(self, vals, include_interactions=False):
+        ar_names = np.array(
             ["ar"+str(i) for i in range(self.auto_order_steps_)]
         )
-        exog_coef_names = np.concatenate(
+        exog_names = np.concatenate(
             [[x+str(i) for i in range(self.exog_order_steps_)]
              for x in self.features_]
         ).T
         
-        coef_names = np.concatenate([ar_coef_names, exog_coef_names])
-
-        coef = pd.Series(
-            self.base_estimator_fitted_.coef_[0:len(coef_names)], 
-            index=coef_names)
-        coef_df = pd.DataFrame(
-            {col: coef[coef.index.str.contains('^'+col+'[0-9]+$')].reset_index(drop=True)
-             for col in self.features_.insert(0,'ar')
+        names = np.concatenate([ar_names, exog_names])
+        
+        vals_no_interactions = pd.Series(vals[:len(names)], index=names)
+        df = pd.DataFrame(
+            {col: vals_no_interactions[vals_no_interactions.index.str.contains('^'+col+'[0-9]+$')].reset_index(drop=True)
+             for col in self.features_.insert(0, 'ar')
              }
         )
         
         if include_interactions:
-            
+
             if isinstance(self.transformer_X, Pipeline):
                 transformers = [step[0] for step in self.transformer_X.steps]
                 if not np.isin(transformers, 'polynomialfeatures').any():
@@ -250,18 +289,18 @@ class GeoMagLinearARX(GeoMagARXRegressor):
                 if not isinstance(self.transformer_X, PolynomialFeatures):
                     raise ValueError("Interaction terms were not computed.")
                 powers = self.transformer_X.powers_
-            
+
             n_features = self.features_.shape[0]
             colnames = self.features_.insert(0, 'ar')
             interaction_masks = powers[n_features+1:].astype(bool)
             interaction_colnames = ['_'.join(colnames[mask].tolist())
-                                 for mask in interaction_masks]
+                                    for mask in interaction_masks]
             interaction_names = np.concatenate(
                 [[x+str(i) for i in range(self.exog_order_steps_)]
                  for x in interaction_colnames]
             )
             interactions = pd.Series(
-                self.base_estimator_fitted_.coef_[len(coef_names):],
+                vals[len(names):],
                 index=interaction_names
             )
             interactions_df = pd.DataFrame(
@@ -269,9 +308,76 @@ class GeoMagLinearARX(GeoMagARXRegressor):
                  for col in interaction_colnames
                  }
             )
-            coef_df = pd.concat([coef_df, interactions_df], axis=1)  
-
+            df = pd.concat([df, interactions_df], axis=1)
+            
+        return df 
+    
+    def get_pval_df(self, include_interactions=False):
+        check_is_fitted(self)
+        pvals = self._compute_pval()
+        pval_df = self._format_df(
+            pvals, include_interactions=include_interactions)
+        return pval_df
+        
+    def get_coef_df(self, include_interactions=False):
+        
+        check_is_fitted(self)
+        coef_df = self._format_df(
+            self.coef_, include_interactions=include_interactions)
         return coef_df
+        
+        # ar_coef_names = np.array(
+        #     ["ar"+str(i) for i in range(self.auto_order_steps_)]
+        # )
+        # exog_coef_names = np.concatenate(
+        #     [[x+str(i) for i in range(self.exog_order_steps_)]
+        #      for x in self.features_]
+        # ).T
+        
+        # coef_names = np.concatenate([ar_coef_names, exog_coef_names])
+
+        # coef = pd.Series(
+        #     self.base_estimator_fitted_.coef_[0:len(coef_names)], 
+        #     index=coef_names)
+        # coef_df = pd.DataFrame(
+        #     {col: coef[coef.index.str.contains('^'+col+'[0-9]+$')].reset_index(drop=True)
+        #      for col in self.features_.insert(0,'ar')
+        #      }
+        # )
+        
+        # if include_interactions:
+            
+        #     if isinstance(self.transformer_X, Pipeline):
+        #         transformers = [step[0] for step in self.transformer_X.steps]
+        #         if not np.isin(transformers, 'polynomialfeatures').any():
+        #             raise ValueError("Interaction terms were not computed.")
+        #         powers = self.transformer_X['polynomialfeatures'].powers_
+        #     else:
+        #         if not isinstance(self.transformer_X, PolynomialFeatures):
+        #             raise ValueError("Interaction terms were not computed.")
+        #         powers = self.transformer_X.powers_
+            
+        #     n_features = self.features_.shape[0]
+        #     colnames = self.features_.insert(0, 'ar')
+        #     interaction_masks = powers[n_features+1:].astype(bool)
+        #     interaction_colnames = ['_'.join(colnames[mask].tolist())
+        #                          for mask in interaction_masks]
+        #     interaction_names = np.concatenate(
+        #         [[x+str(i) for i in range(self.exog_order_steps_)]
+        #          for x in interaction_colnames]
+        #     )
+        #     interactions = pd.Series(
+        #         self.base_estimator_fitted_.coef_[len(coef_names):],
+        #         index=interaction_names
+        #     )
+        #     interactions_df = pd.DataFrame(
+        #         {col: interactions[interactions.index.str.contains('^'+col+'[0-9]+$')].reset_index(drop=True)
+        #          for col in interaction_colnames
+        #          }
+        #     )
+        #     coef_df = pd.concat([coef_df, interactions_df], axis=1)  
+
+        # return coef_df
 
 # class GeoMagGP(GeoMagTSRegressor):
 #     def __init__(self, **params):
