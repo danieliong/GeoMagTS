@@ -14,6 +14,7 @@ import warnings
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_pdf import PdfPages
+from lazyarray import larray
 
 class GeoMagARXProcessor():
     def __init__(self,
@@ -27,7 +28,8 @@ class GeoMagARXProcessor():
                  time_resolution='5T',
                  D=1500000,
                  storm_level=0,
-                 time_level=1):
+                 time_level=1,
+                 save_lazy_data=True):
         self.auto_order = auto_order
         self.exog_order = exog_order
         self.pred_step = pred_step
@@ -39,6 +41,7 @@ class GeoMagARXProcessor():
         self.D = D
         self.storm_level = storm_level
         self.time_level = time_level
+        self.save_lazy_data = save_lazy_data
         self.processor_fitted_ = False
 
     def check_data(self, X, y=None, fit=True, check_multi_index=True,
@@ -232,6 +235,10 @@ class GeoMagARXProcessor():
             if y is not None:
                 y_ = y_[mask]
         
+        if fit and self.save_lazy_data:
+            self.train_features_ =  larray(X_)
+            self.train_target_ = larray(y_)
+        
         return X_, y_
         
     def process_predictions(self, ypred, Vx=None, 
@@ -247,20 +254,31 @@ class GeoMagARXProcessor():
             check_is_fitted(self.target_processor_.transformer)
             ypred_ = self.target_processor_.transformer.inverse_transform(
                 ypred_.reshape(-1, 1)).flatten()
-        else:
-            if isinstance(ypred_, (pd.Series, pd.DataFrame)):
-                ypred_ = ypred_.to_numpy()
-            elif isinstance(ypred_, torch.Tensor):
-                ypred_ = ypred_.numpy()
+            ypred_ = pd.Series(ypred_, index = ypred.index)
+        # elif isinstance(ypred_, torch.Tensor):
+        #     ypred_ = ypred_.numpy()
+        # else:
+        #     if isinstance(ypred_, (pd.Series, pd.DataFrame)):
+        #         ypred_ = ypred_.to_numpy()
+        #     elif isinstance(ypred_, torch.Tensor):
+        #         ypred_ = ypred_.numpy()
 
         # TODO: Find more efficient way to do this
         if isinstance(Vx.index, pd.MultiIndex):
             times = Vx.index.get_level_values(level=self.time_level)
-            storms = Vx.index.get_level_values(level=self.storm_level)
+            # storms = Vx.index.get_level_values(level=self.storm_level)
             shifted_times = times + pd.Timedelta(minutes=self.pred_step)
         else:
             shifted_times = Vx.index + pd.Timedelta(minutes=self.pred_step)
 
+        # Vx_ = Vx
+        # if copy:
+        #     if isinstance(Vx_, (np.ndarray, pd.Series, pd.DataFrame)):
+        #         Vx_ = Vx_.copy()
+        #     elif isinstance(Vx_, torch.Tensor):
+        #         Vx_ = Vx_.clone()
+        # Vx_ = Vx_.reindex(shifted_times, level=self.time_level)
+            
         test_prop_time_processor = PropagationTimeProcessor(
             Vx=Vx.reindex(shifted_times, level=self.time_level),
             time_resolution=self.time_resolution,
@@ -269,11 +287,13 @@ class GeoMagARXProcessor():
             storm_level=self.storm_level,
             time_level=self.time_level)
         pred_times = test_prop_time_processor.propagated_times_
+        mask = test_prop_time_processor._get_mask(Vx)
 
         if isinstance(Vx.index, pd.MultiIndex):
-            ypred_ = pd.Series(ypred_, index=[storms, pred_times])
+            ypred_ = pd.Series(ypred_[mask], 
+                               index=[pred_times.index, pred_times])
         else:
-            ypred_ = pd.Series(ypred_, index=pred_times)
+            ypred_ = pd.Series(ypred_[mask], index=pred_times)
         
         # Remove duplicate indices that may have resulted from 
         # processing propagation time
@@ -283,34 +303,48 @@ class GeoMagARXProcessor():
         return ypred_
     
     def _predict_persistence(self, y, Vx=None):
-        ypred = y.shift(periods=self.pred_step, freq='T')
+        if isinstance(y.index, pd.MultiIndex):
+            ypred = y.groupby(level=self.storm_level_).apply(
+                lambda x: x.unstack(level=self.storm_level_).shift(
+                    periods=self.pred_step, freq='T'
+                )
+            )
+        else:
+            ypred = y.shift(periods=self.pred_step, freq='T')
+        
         if self.propagate:
             pers_prop_time_processor = PropagationTimeProcessor(
-                Vx=Vx, time_resolution=self.time_resolution,
+                Vx=Vx.reindex(ypred.index).dropna(), 
+                time_resolution=self.time_resolution,
                 D=self.D)
-            pers_prop_time_processor = pers_prop_time_processor.fit(ypred)
+            pers_prop_time_processor = pers_prop_time_processor.fit(
+                ypred, storm_level=self.storm_level, 
+                time_level=self.time_level)
+            mask = pers_prop_time_processor.mask_
+            prop_times = pers_prop_time_processor.propagated_times_[mask] 
             
             if isinstance(y.index, pd.MultiIndex):
                 ypred = pd.Series(
-                    ypred.values,
-                    index=[y.index.get_level_values(level=self.storm_level),
-                           pers_prop_time_processor.propagated_times_.values
-                        ]
+                    ypred.values.flatten()[mask],
+                    index=[prop_times.index, prop_times],
                     )
             else:
                 ypred = pd.Series(
-                    ypred.values, 
-                    index=pers_prop_time_processor.propagated_times_.values)
+                    ypred.values[mask], 
+                    index=prop_times.values)
             
             ypred = self._remove_duplicates(ypred, fit=False)
             
         return ypred
     
-    def _plot_one_storm(self, storm_idx, y, ypred,
+    def _plot_one_storm(self, storm_idx, y, ypred, X=None,
                         ypred_persistence=None, lower=None, upper=None, display_info=False, figsize=(10, 7), 
                         model_name=None, sw_to_plot=None, **more_info):
 
         if sw_to_plot is not None:
+            if X is None:
+                raise ValueError("X needs to be specified if sw_to_plot is specified.")
+            
             n_sw_to_plot = len(sw_to_plot)
             fig, ax = plt.subplots(nrows=n_sw_to_plot+1, 
                                    ncols=1,
@@ -337,7 +371,7 @@ class GeoMagARXProcessor():
         if self.propagate:
             pred_label = pred_label + 'Propagated '
         if self.pred_step > 0:
-            pred_label = pred_label + str(self.pred_step) + 'min. ahead'
+            pred_label = pred_label + str(self.pred_step) + 'min. ahead '
         pred_label = pred_label + 'prediction (RMSE: '+ str(rmse)+')'
         
         # ypred_.unstack(level=self.storm_level).plot(
@@ -372,11 +406,11 @@ class GeoMagARXProcessor():
 
         if display_info:
             info = 'Storm #'+str(storm_idx)+": " + \
-            'time_resolution='+str(self.time_resolution)+', '+ \
             'auto_order='+str(self.auto_order)+', ' + \
-            'exog_order='+str(self.exog_order)+' (in min.)'
+            'exog_order='+str(self.exog_order)+' (in min.) '
+            
             if model_name is not None:
-                info = info + ', ' + model_name 
+                info = info + '[Model: ' + model_name + ']'
             
             if len(more_info) != 0:
                 info = info + ' ('
@@ -392,7 +426,7 @@ class GeoMagARXProcessor():
         if sw_to_plot is not None:
             
             for i in range(n_sw_to_plot):
-                ax[i+1].plot(X[sw_to_plot[i]], label=sw_to_plot[i], 
+                ax[i+1].plot(X[sw_to_plot[i]][storm_idx], label=sw_to_plot[i], 
                         color='black', linewidth=0.5)
                 ax[i+1].legend()
                 ax[i+1].xaxis.set_major_locator(locator)
@@ -401,10 +435,9 @@ class GeoMagARXProcessor():
             fig.tight_layout()
         return fig, ax
 
-    def plot_predict(self, y, ypred, 
+    def plot_predict(self, y, ypred, X=None,
                      upper=None, lower=None,
                      plot_persistence=True,
-                     Vx=None,
                      storms_to_plot=None,
                      display_info=False,
                      figsize=(15, 10),
@@ -428,8 +461,12 @@ class GeoMagARXProcessor():
             ypred = ypred.loc[idx[storms_to_plot, :]]
             y = y.loc[idx[storms_to_plot, :]]
             
-        if plot_persistence and Vx is not None:
-            ypred_persistence = self._predict_persistence(y, Vx=Vx)
+        if plot_persistence:
+            if X is None:
+                raise ValueError("X needs to specified if plot_persistence is True.")
+            
+            ypred_persistence = self._predict_persistence(
+                y, Vx=X[self.vx_colname])
         else:
             ypred_persistence = None
             
@@ -440,7 +477,7 @@ class GeoMagARXProcessor():
 
             # rmse = self.score(X.loc[storm], y.loc[storm])
             fig, ax = self._plot_one_storm(storm,
-                y, ypred, ypred_persistence=ypred_persistence, 
+                y, ypred, X=X, ypred_persistence=ypred_persistence, 
                 lower=lower, upper=upper, display_info=display_info,
                 figsize=figsize, model_name=model_name, 
                 sw_to_plot=sw_to_plot, **more_info)
@@ -544,7 +581,7 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
         self.D = D
 
     def _compute_propagated_time(self, x):
-        return x['time'] + pd.Timedelta(x['prop_time'], unit='sec').floor(freq=self.time_resolution)
+        return (x['time'] + pd.Timedelta(x['prop_time'], unit='sec')).floor(freq=self.time_resolution)
 
     def _compute_times(self, storm_level=0, time_level=1):
         self.propagation_in_sec_ = self.D / self.Vx.abs()
@@ -563,10 +600,10 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
 
         return None
 
-    def _get_mask(self, X):
+    def _get_mask(self, X, time_level=1):
         # Get mask of where propagated times are in X's time index
         if isinstance(X.index, pd.MultiIndex):
-            X_times = X.index.get_level_values(level=self.time_level_)
+            X_times = X.index.get_level_values(level=time_level)
             proptime_in_X_mask = np.in1d(self.propagated_times_, X_times)
         else:
             proptime_in_X_mask = np.in1d(self.propagated_times_, X.index)
@@ -592,7 +629,7 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
 
         self._compute_times(storm_level=storm_level,
                             time_level=time_level)
-        self.mask_ = self._get_mask(X)
+        self.mask_ = self._get_mask(X, time_level=self.time_level_)
 
         return self
 
