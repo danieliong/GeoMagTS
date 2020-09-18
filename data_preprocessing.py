@@ -3,12 +3,13 @@ from sklearn.utils.validation import check_is_fitted, check_X_y, check_array
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import GroupKFold
 
+import warnings
 import numpy as np
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
 from GeoMagTS.utils import get_storm_indices, MetaLagFeatureProcessor, shift
 import matplotlib.pyplot as plt
-import warnings
+from functools import lru_cache
 
 class DataFrameSelector(BaseEstimator, TransformerMixin):
     def __init__(self, column_names=None):
@@ -25,6 +26,10 @@ class DataFrameSelector(BaseEstimator, TransformerMixin):
         # Check if column_names are in X
         if not all(col in X.columns for col in self.column_names):
             raise ValueError("Not all names in column_names are in X.")
+        
+        if isinstance(self.column_names, tuple):
+            self.column_names = list(self.column_names)
+        
         return self
 
     def transform(self, X, y=None):
@@ -239,14 +244,15 @@ class StormSplitter(BaseEstimator, TransformerMixin):
         else:
             return self.train_storms, self.test_storms_
 
-def prepare_geomag_data(data, storm_times_df, 
+@lru_cache(maxsize=None)
+def prepare_geomag_data(data_file, storm_times_file, 
                         test_storms=None, 
                         min_threshold=None,
                         test_size=1,
                         time_resolution='5T', 
                         target_column='sym_h',
-                        feature_columns=['bz','vx_gse','density'],
-                        storms_to_delete=[15, 69, 124],
+                        feature_columns=('bz','vx_gse','density'),
+                        storms_to_delete=(15, 69, 124),
                         start='2000',
                         end='2030',
                         split_train_test=True):
@@ -259,9 +265,12 @@ def prepare_geomag_data(data, storm_times_df,
         raise ValueError(
             "test_storms and min_threshold cannot both be specified. Specify only one and try again."
             )
+    
+    data = pd.read_pickle(data_file)
+    storm_times_df = pd.read_pickle(storm_times_file)
 
     # Data processing pipeline for entire dataframe
-    column_selector = DataFrameSelector([target_column]+feature_columns)
+    column_selector = DataFrameSelector((target_column,)+feature_columns)
     time_res_resampler = TimeResolutionResampler(time_resolution)
     storms_processor = StormsProcessor(storm_times_df=storm_times_df,
                                        storms_to_delete=storms_to_delete,start=start,
