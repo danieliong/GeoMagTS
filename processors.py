@@ -29,7 +29,7 @@ class GeoMagARXProcessor():
                  D=1500000,
                  storm_level=0,
                  time_level=1,
-                 save_lazy_data=True):
+                 lazy=True):
         self.auto_order = auto_order
         self.exog_order = exog_order
         self.pred_step = pred_step
@@ -41,7 +41,7 @@ class GeoMagARXProcessor():
         self.D = D
         self.storm_level = storm_level
         self.time_level = time_level
-        self.save_lazy_data = save_lazy_data
+        self.lazy = lazy
         self.processor_fitted_ = False
 
     def check_data(self, X, y=None, fit=True, check_multi_index=True,
@@ -124,7 +124,7 @@ class GeoMagARXProcessor():
                 "Inputs have duplicated indices. Only one of each row with duplicated indices will be kept.")
         
         if fit:
-            self.dupl_mask_ = dupl_mask_
+            self.dupl_mask_ = larray(dupl_mask_)
         
         if y is not None:
             if not X.index.equals(y.index):
@@ -235,12 +235,52 @@ class GeoMagARXProcessor():
             if y is not None:
                 y_ = y_[mask]
         
-        if fit and self.save_lazy_data:
-            self.train_features_ =  larray(X_)
-            self.train_target_ = larray(y_)
+        if fit:
+            self.train_features_ =  X_
+            self.train_target_ = y_
         
         return X_, y_
+    
+    def _check_processor_fitted(self, check_lazy=True):
+        if not self.processor_fitted_:
+            raise NotProcessedError(self)
+        if check_lazy and not self.lazy:
+            raise ValueError("self.lazy must be True.")
+    
+    @property
+    def train_features_(self):
+        if self.lazy:
+            return self.train_features__.evaluate()
+        else:
+            return self.train_features__
+    
+    @train_features_.setter
+    def train_features_(self, train_features_):
+        if self.lazy:
+            self.train_features__ = larray(train_features_)
+        else:
+            self.train_features__ = train_features_
+            
+    @property
+    def train_target_(self):
+        if self.lazy:
+            return self.train_target__.evaluate()
+        else:
+            return self.train_target__
+    
+    @train_target_.setter
+    def train_target_(self, train_target_):
+        if self.lazy:
+            self.train_target__ = larray(train_target_)
+        else:
+            self.train_target__ = train_target_
+            
+    @property
+    def train_shape_(self):
+        self._check_processor_fitted(check_lazy=False)
+        return self.train_features__.shape
         
+    
     def process_predictions(self, ypred, Vx=None, 
                              inverse_transform_y=True, copy=True):
         ypred_ = ypred
@@ -291,8 +331,8 @@ class GeoMagARXProcessor():
         test_prop_time_processor._compute_times(
             storm_level=self.storm_level,
             time_level=self.time_level)
-        mask = test_prop_time_processor._get_mask(Vx_)
-        pred_times = test_prop_time_processor.propagated_times_[mask]
+        mask = test_prop_time_processor._compute_mask(Vx_)
+        pred_times = test_prop_time_processor.propagated_times[mask]
 
         if isinstance(Vx.index, pd.MultiIndex):
             ypred_ = pd.Series(ypred_[mask], 
@@ -326,7 +366,7 @@ class GeoMagARXProcessor():
                 ypred, storm_level=self.storm_level, 
                 time_level=self.time_level)
             mask = pers_prop_time_processor.mask_
-            prop_times = pers_prop_time_processor.propagated_times_[mask] 
+            prop_times = pers_prop_time_processor.propagated_times[mask] 
             
             if isinstance(y.index, pd.MultiIndex):
                 ypred = pd.Series(
@@ -581,41 +621,46 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
                  Vx=None,
                  time_resolution='5T',
-                 D=1500000):
+                 D=1500000,
+                 lazy=True):
         self.Vx = Vx
         self.time_resolution = time_resolution
         self.D = D
+        self.lazy = lazy
 
     def _compute_propagated_time(self, x):
         return (x['time'] + pd.Timedelta(x['prop_time'], unit='sec')).floor(freq=self.time_resolution)
 
     def _compute_times(self, storm_level=0, time_level=1):
-        self.propagation_in_sec_ = self.D / self.Vx.abs()
-        self.propagation_in_sec_.rename("prop_time", inplace=True)
+        propagation_in_sec_ = self.D / self.Vx.abs()
+        propagation_in_sec_.rename("prop_time", inplace=True)
 
-        if isinstance(self.propagation_in_sec_.index, pd.MultiIndex):
-            self.propagation_in_sec_.index.rename(
+        if isinstance(propagation_in_sec_.index, pd.MultiIndex):
+            propagation_in_sec_.index.rename(
                 names='time', level=time_level, inplace=True)
-            self.propagated_times_ = self.propagation_in_sec_.reset_index(
+            propagated_times_ = propagation_in_sec_.reset_index(
                 level=time_level).apply(self._compute_propagated_time, axis=1)
         else:
-            self.propagation_in_sec_.index.rename('time', inplace=True)
-            self.propagated_times_ = self.propagation_in_sec_.reset_index().apply(
+            propagation_in_sec_.index.rename('time', inplace=True)
+            propagated_times_ = propagation_in_sec_.reset_index().apply(
                 self._compute_propagated_time, axis=1)
-            self.propagated_times_.rename('times', inplace=True)
+            propagated_times_.rename('times', inplace=True)
+        
+        self.propagation_in_sec = propagation_in_sec_
+        self.propagated_times = propagated_times_
 
         return None
-
-    def _get_mask(self, X, time_level=1):
+    
+    def _compute_mask(self, X, time_level=1):
         # Get mask of where propagated times are in X's time index
         if isinstance(X.index, pd.MultiIndex):
             X_times = X.index.get_level_values(level=time_level)
-            proptime_in_X_mask = np.in1d(self.propagated_times_, X_times)
+            proptime_in_X_mask = np.in1d(self.propagated_times, X_times)
         else:
-            proptime_in_X_mask = np.in1d(self.propagated_times_, X.index)
+            proptime_in_X_mask = np.in1d(self.propagated_times, X.index)
 
         # Get mask of where propagated times are duplicated
-        dupl_mask = self.propagated_times_.duplicated(keep='last').values
+        dupl_mask = self.propagated_times.duplicated(keep='last').values
         mask = np.logical_and(proptime_in_X_mask, ~dupl_mask)
         return mask
 
@@ -625,7 +670,7 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
             raise ValueError("Vx must be specified.")
         elif not isinstance(self.Vx, pd.Series):
             raise TypeError("Vx must be a pd.Series (for now).")
-
+        
         self.storm_level_ = storm_level
         self.time_level_ = time_level
 
@@ -635,10 +680,10 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
 
         self._compute_times(storm_level=storm_level,
                             time_level=time_level)
-        self.mask_ = self._get_mask(X, time_level=self.time_level_)
+        self.mask_ = self._compute_mask(X, time_level=self.time_level_)
 
         return self
-
+        
     def transform(self, X, y=None):
         check_is_fitted(self)
 
@@ -646,12 +691,68 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
             if isinstance(X.index, pd.MultiIndex):
                 storms = X.index.get_level_values(level=self.storm_level_)
                 return X.reindex(
-                    [storms[self.mask_], self.propagated_times_[self.mask_]]
+                    [storms[self.mask_], self.propagated_times[self.mask_]]
                 )
             else:
-                return X.reindex(self.propagated_times_[self.mask_])
+                return X.reindex(
+                    [self.mask_])
         else:
             return X
+    
+    @property
+    def propagation_in_sec(self):
+        if self.lazy:
+            # Reconstruct series
+            df = pd.Series(self.propagation_in_sec_.evaluate())
+            if len(self.propagation_in_sec_idx_names_) > 1:
+                df.index = pd.MultiIndex.from_tuples(
+                    self.propagation_in_sec_idx_.evaluate(),
+                    names=self.propagation_in_sec_idx_names_)
+            else:
+                df.set_index(self.propagation_in_sec_idx_, inplace=True)
+
+            return df
+        else:
+            return self.propagation_in_sec_
+
+    @propagation_in_sec.setter
+    def propagation_in_sec(self, propagation_in_sec):        
+        if self.lazy:
+            if isinstance(propagation_in_sec, (pd.DataFrame, pd.Series)):
+                # Save index and index names to recreate pd object later.
+                self.propagation_in_sec_idx_names_ = propagation_in_sec.index.names
+                self.propagation_in_sec_idx_ = larray(propagation_in_sec.index)
+                
+            self.propagation_in_sec_ = larray(propagation_in_sec)
+        else:
+            self.propagation_in_sec_ = propagation_in_sec
+            
+    @property
+    def propagated_times(self):
+        if self.lazy:
+            # Reconstruct series 
+            df = pd.Series(self.propagated_times_.evaluate())
+            if len(self.propagated_times_idx_names_) > 1:
+                df.index = pd.MultiIndex.from_tuples(
+                    self.propagated_times_idx_.evaluate(),
+                    names=self.propagated_times_idx_names_)
+            else:
+                df.index = self.propagated_times_idx_
+            return df
+        else:
+            return self.propagated_times_
+
+    @propagated_times.setter
+    def propagated_times(self, propagated_times):
+        if self.lazy:
+            if isinstance(propagated_times, (pd.DataFrame, pd.Series)):
+                # Save index and index names to recreate pd object later.
+                self.propagated_times_idx_names_ = propagated_times.index.names
+                self.propagated_times_idx_ = larray(propagated_times.index)
+
+            self.propagated_times_ = larray(propagated_times)
+        else:
+            self.propagated_times_ = propagated_times
 
 class TargetProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
