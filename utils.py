@@ -8,11 +8,12 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.utils.validation import check_is_fitted
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import mean_squared_error
+from sklearn.pipeline import Pipeline
 from numpy.random import randint
 from collections import deque
 
-
-def get_storm_indices(data, stormtimes_df, include_storms, time_resolution='5T'):
+def get_storm_indices(data, stormtimes_df, 
+                      include_storms, time_resolution='5T'):
     stormtimes_list = [
         pd.date_range(t['start_time'].round(time_resolution),
                       t['end_time'], freq=time_resolution)
@@ -40,6 +41,47 @@ def _get_NA_mask(X, y=None, mask_y=False):
     
     mask = ~np.isnan(data_).any(axis=1)
     return mask
+
+
+def _pd_fit(transformer, X, y=None, **transformer_fit_params):
+    if transformer is not None:
+        if isinstance(X, pd.Series):
+            X_np = X.to_numpy().reshape(-1, 1)
+            return transformer.fit(X_np, **transformer_fit_params)
+        elif isinstance(X, pd.DataFrame):
+            return transformer.fit(X, **transformer_fit_params)
+        else:
+            raise TypeError(
+                "_pd_fit is meant to only take in pandas objects as input.")
+    else:
+        return None
+
+
+def _pd_transform(transformer, X, y=None):
+    if transformer is not None:
+        if isinstance(transformer, Pipeline):
+            # Check each step of Pipeline
+            for step in transformer.steps:
+                check_is_fitted(step[1])
+        else:
+            check_is_fitted(transformer)
+
+        if isinstance(X, pd.Series):
+            # Need to reshape
+            X_transf = transformer.transform(
+                X.to_numpy().reshape(-1, 1)).flatten()
+            X_transf = pd.Series(X_transf, index=X.index)
+        elif isinstance(X, pd.DataFrame):
+            X_transf = transformer.transform(X)
+            X_transf = pd.DataFrame(X_transf, index=X.index)
+        else:
+            raise TypeError(
+                "_pd_transform is meant to only take in pandas objects as input.")
+
+        return X_transf
+    else:
+        # Do nothing
+        return X
 
 def mse_masked(y, ypred, squared=True, round=False, copy=True, **kwargs):
     y_ = y
@@ -86,7 +128,6 @@ def get_min_y_storms(y, storm_labels=None):
                       for i in unique_storms]
                      )
     return min_y
-
 
 # THE FUNCTIONS BELOW WERE TAKEN FROM FIRETS (https://github.com/jxx123/fireTS) AND MODIFIED SLIGHTLY
 
