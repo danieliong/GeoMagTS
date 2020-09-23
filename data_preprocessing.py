@@ -11,6 +11,65 @@ from GeoMagTS.utils import get_storm_indices, MetaLagFeatureProcessor, shift
 import matplotlib.pyplot as plt
 from functools import lru_cache
 
+
+@lru_cache(maxsize=None)
+def prepare_geomag_data(data_file, storm_times_file,
+                        test_storms=None,
+                        min_threshold=None,
+                        test_size=1,
+                        time_resolution='5T',
+                        target_column='sym_h',
+                        feature_columns=('bz', 'vx_gse', 'density'),
+                        storms_to_delete=(15, 69, 124),
+                        start='2000',
+                        end='2030',
+                        split_train_test=True,
+                        smooth_method=None,
+                        smooth_window=30):
+
+    if test_storms is None and min_threshold is None:
+        raise ValueError(
+            "Either test_storms or min_threshold must be specified. Specify only one and try again."
+        )
+    elif test_storms is not None and min_threshold is not None:
+        raise ValueError(
+            "test_storms and min_threshold cannot both be specified. Specify only one and try again."
+        )
+
+    data = pd.read_pickle(data_file)
+    storm_times_df = pd.read_pickle(storm_times_file)
+
+    # Data processing pipeline for entire dataframe
+    column_selector = DataFrameSelector((target_column,)+feature_columns)
+    time_res_resampler = TimeResolutionResampler(time_resolution)
+    storms_processor = StormsProcessor(storm_times_df=storm_times_df,
+                                       storms_to_delete=storms_to_delete, start=start,
+                                       end=end)
+
+    pipeline_transformers = [
+        ("selector", column_selector),
+        ("resampler", time_res_resampler),
+        ("processor", storms_processor)
+    ]
+    
+    if smooth_method is not None:
+        smoother = MovingAverageSmoother(method=smooth_method,
+                                         window=smooth_window,
+                                         time_resolution=time_resolution)
+        pipeline_transformers.append(
+            ('smoother', smoother))
+
+    if split_train_test:
+        storm_splitter = StormSplitter(test_storms=test_storms,
+                                       min_threshold=min_threshold, test_size=test_size)
+        pipeline_transformers.append(
+            ("splitter", storm_splitter))
+
+    data_pipeline = Pipeline(pipeline_transformers)
+    processed_data = data_pipeline.fit_transform(data)
+
+    return processed_data
+
 class DataFrameSelector(BaseEstimator, TransformerMixin):
     def __init__(self, column_names=None):
         """Subset columns in pandas DataFrame 
@@ -57,6 +116,71 @@ class TimeResolutionResampler(BaseEstimator, TransformerMixin):
 
     def transform(self, X, y=None):
         return X.resample(self.time_resolution).apply(self.func)
+
+
+class MovingAverageSmoother(BaseEstimator, TransformerMixin):
+    def __init__(self,
+                 method='simple',
+                 window=30,
+                 func=np.mean,
+                 time_resolution='5T',
+                 copy=True, **kwargs):
+        self.method = method
+        self.window = window
+        self.func = func
+        self.time_resolution = time_resolution
+        self.copy = copy
+        self.kwargs = kwargs
+        
+    def fit(self, X, y=None, target_column='sym_h', 
+            storm_level=0, time_level=1):
+        self.target_column_ = target_column
+        self.storm_level_ = storm_level
+        self.time_level_ = time_level
+        
+        self.window_freq_ = str(self.window) + 'T'
+        
+        if isinstance(X.index, pd.MultiIndex):
+            times = X.index.get_level_values(level=self.time_level_)
+        else:
+            times = X.index
+        if not isinstance(times, pd.DatetimeIndex):
+            raise TypeError(
+                "Index must be DatetimeIndex.")
+            
+        return self
+
+    def transform(self, X, y=None):
+        check_is_fitted(self)
+        X_ = X
+        if self.copy:
+            X_ = X_.copy()
+            
+        if isinstance(X_.index, pd.MultiIndex):
+            X_ = X_.groupby(level=self.storm_level_).apply(self._transform_one_storm)
+        else:
+            X_ = X_.apply(self._transform_one_storm)
+            
+        return X_
+    
+    def _transform_one_storm(self, x):
+        if isinstance(x.index, pd.MultiIndex):
+            times = x.index.get_level_values(level=self.time_level_)
+        else:
+            times = x.index
+        if not isinstance(times, pd.DatetimeIndex):
+            raise TypeError(
+                "Index must be DatetimeIndex.")
+            
+        if self.method == 'simple':
+            x[self.target_column_] = x[self.target_column_].rolling(
+                self.window_freq_, on=times, **self.kwargs).apply(self.func)
+        else:
+            raise TypeError(self.method+" is not implemented (yet).")
+        
+        return x
+        
+        
 
 class StormsProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
@@ -243,52 +367,3 @@ class StormSplitter(BaseEstimator, TransformerMixin):
             return self.train_storms_, self.test_storms_
         else:
             return self.train_storms, self.test_storms_
-
-@lru_cache(maxsize=None)
-def prepare_geomag_data(data_file, storm_times_file, 
-                        test_storms=None, 
-                        min_threshold=None,
-                        test_size=1,
-                        time_resolution='5T', 
-                        target_column='sym_h',
-                        feature_columns=('bz','vx_gse','density'),
-                        storms_to_delete=(15, 69, 124),
-                        start='2000',
-                        end='2030',
-                        split_train_test=True):
-
-    if test_storms is None and min_threshold is None:
-        raise ValueError(
-            "Either test_storms or min_threshold must be specified. Specify only one and try again."
-            )
-    elif test_storms is not None and min_threshold is not None:
-        raise ValueError(
-            "test_storms and min_threshold cannot both be specified. Specify only one and try again."
-            )
-    
-    data = pd.read_pickle(data_file)
-    storm_times_df = pd.read_pickle(storm_times_file)
-
-    # Data processing pipeline for entire dataframe
-    column_selector = DataFrameSelector((target_column,)+feature_columns)
-    time_res_resampler = TimeResolutionResampler(time_resolution)
-    storms_processor = StormsProcessor(storm_times_df=storm_times_df,
-                                       storms_to_delete=storms_to_delete,start=start,
-                                       end=end)
-    
-    pipeline_transformers = [
-        ("selector", column_selector),
-        ("resampler", time_res_resampler),
-        ("processor", storms_processor)
-        ]
-    
-    if split_train_test:
-        storm_splitter = StormSplitter(test_storms=test_storms,
-                                       min_threshold=min_threshold,test_size=test_size)
-        pipeline_transformers.append(
-            ("splitter", storm_splitter))
-    
-    data_pipeline = Pipeline(pipeline_transformers)
-    processed_data = data_pipeline.fit_transform(data)
-    
-    return processed_data
