@@ -1,20 +1,42 @@
-
 import torch
 import numpy as np
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
-from GeoMagTS.utils import MetaLagFeatureProcessor, _get_NA_mask, mse_masked
+from GeoMagTS.utils import MetaLagFeatureProcessor, _get_NA_mask, _pd_fit, _pd_transform, mse_masked
 
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted, check_X_y, check_array
-from sklearn.pipeline import Pipeline
+from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import PolynomialFeatures
 
 import warnings
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_pdf import PdfPages
 from lazyarray import larray
+from cached_property import cached_property
+import functools
+from functools import wraps, partial
+
+
+def requires_processor_fitted(method):
+
+    @wraps(method)
+    def wrapped_method(self, *args, **kwargs):
+        if not self.processor_fitted_:
+            raise NotProcessedError(self)
+        return method(self, *args, **kwargs)
+
+    return wrapped_method
+
+
+class NotProcessedError(Exception):
+    def __init__(self, obj):
+        class_name = obj.__class__.__name__
+        self.message = "Data have not been previously processed using process_data in "+obj.__class__.__name__+". Please call" + \
+            obj.__class__.__name__+".process_data with fit=True first."
+
 
 class GeoMagARXProcessor():
     def __init__(self,
@@ -23,6 +45,8 @@ class GeoMagARXProcessor():
                  pred_step=0,
                  transformer_X=None,
                  transformer_y=None,
+                 include_interactions=False,
+                 interactions_degree=2,
                  propagate=True,
                  vx_colname='vx_gse',
                  time_resolution='5T',
@@ -35,8 +59,12 @@ class GeoMagARXProcessor():
         self.pred_step = pred_step
         self.transformer_X = transformer_X
         self.transformer_y = transformer_y
+        self.include_interactions = include_interactions
+        self.interactions_degree = interactions_degree
         self.propagate = propagate
         self.vx_colname = vx_colname
+
+        # FIXME: This shouldn't be input.
         self.time_resolution = time_resolution
         self.D = D
         self.storm_level = storm_level
@@ -44,12 +72,83 @@ class GeoMagARXProcessor():
         self.lazy = lazy
         self.processor_fitted_ = False
 
+    @property
+    @requires_processor_fitted
+    def interactions_processor_(self):
+        if self.include_interactions:
+            if self.transformer_X is not None:
+                return self.feature_processor_.transformer['polynomialfeatures']
+            else:
+                return self.feature_processor_.transformer
+        else:
+            return None
+
+    @property
+    @requires_processor_fitted
+    def train_features_(self):
+        if self.lazy:
+            return self.train_features__.evaluate()
+        else:
+            return self.train_features__
+
+    @train_features_.setter
+    def train_features_(self, train_features_):
+        if self.lazy:
+            self.train_features__ = larray(train_features_)
+        else:
+            self.train_features__ = train_features_
+
+    @property
+    @requires_processor_fitted
+    def train_target_(self):
+        if self.lazy:
+            return self.train_target__.evaluate()
+        else:
+            return self.train_target__
+
+    @train_target_.setter
+    def train_target_(self, train_target_):
+        if self.lazy:
+            self.train_target__ = larray(train_target_)
+        else:
+            self.train_target__ = train_target_
+
+    @property
+    @requires_processor_fitted
+    def train_storms_(self):
+        if self.lazy:
+            return self.train_storms__.evaluate()
+        else:
+            return self.train_storms__
+
+    @train_storms_.setter
+    def train_storms_(self, train_storms_):
+        if self.lazy:
+            self.train_storms__ = larray(train_storms_)
+        else:
+            self.train_storms__ = train_storms_
+
+    @property
+    @requires_processor_fitted
+    def train_shape_(self):
+        return self.train_features__.shape
+
+    @property
+    def dupl_mask_(self):
+        if self.lazy:
+            return self.dupl_mask__.evaluate()
+        else:
+            return self.dupl_mask__
+
+    @dupl_mask_.setter
+    def dupl_mask_(self, dupl_mask_):
+        if self.lazy:
+            self.dupl_mask__ = larray(dupl_mask_)
+        else:
+            self.dupl_mask__ = dupl_mask_
+
     def check_data(self, X, y=None, fit=True, check_multi_index=True,
                    check_vx_col=True, check_same_cols=False, check_same_indices=True, **sklearn_check_params):
-
-        # if not remove_duplicates:
-        #     # Don't need to copy since X, y are not manipulated.
-        #     copy=False
 
         # Check without converting to np arrays
         _ = check_X_y(X, y, y_numeric=True, **sklearn_check_params)
@@ -64,11 +163,6 @@ class GeoMagARXProcessor():
             if X.index.nlevels < 2:
                 raise ValueError(
                     "X.index must have at least 2 levels corresponding to storm and times if it is a MultiIndex.")
-                
-            # if remove_duplicates:
-            #     # Get mask for removing duplicates
-            #     dupl_mask_ = X.index.get_level_values(
-            #         level=self.time_level).duplicated(keep='last')
 
         elif check_multi_index:
             raise TypeError("X must have a MultiIndex (for now).")
@@ -76,24 +170,15 @@ class GeoMagARXProcessor():
         elif not isinstance(X.index, pd.DatetimeIndex):
             raise TypeError("Time index must be of type pd.DatetimeIndex.")
 
-        # if fit and remove_duplicates:
-        #     # Save dupl_mask_
-        #     self.dupl_mask_ = dupl_mask_
-
-        # if remove_duplicates:
-        #     if dupl_mask_.any():
-        #         warnings.warn(
-        #             "Inputs have duplicated indices. Only one of each row with duplicated indices will be kept.")
-
         # Check if vx_colname is in X
         if check_vx_col and self.vx_colname not in X.columns:
             raise ValueError("X does not have column "+self.vx_colname_+".")
 
         if check_same_cols:
-            if not X.columns.equals(self.features_):
+            if not X.columns.equals(self.train_features_cols_):
                 raise ValueError(
                     "X must have the same columns as the X used for fitting.")
-        
+
         if y is not None:
             if not isinstance(y, (pd.Series, pd.DataFrame)):
                 raise TypeError("y must be a pandas object (for now).")
@@ -101,52 +186,34 @@ class GeoMagARXProcessor():
             # Check if X, y have same times
             if check_same_indices and not X.index.equals(y.index):
                 raise ValueError("X, y do not have the same indices.")
-            
-            # if remove_duplicates:
-            #     y_ = y_[~dupl_mask_]
 
-        # if remove_duplicates:
-        #     X_ = X_[~dupl_mask_]
-
-        # return X_, y_
         return None
-    
-    def _remove_duplicates(self, X, y=None, fit=True):
-        
+
+    def _compute_duplicate_time_mask(self, X, fit=True):
         if isinstance(X.index, pd.MultiIndex):
-            dupl_mask_ = X.index.get_level_values(
+            dupl_mask_ = ~X.index.get_level_values(
                 level=self.time_level).duplicated(keep='last')
         else:
-            dupl_mask_ = X.index.duplicated(keep='last')
-            
-        if dupl_mask_.any():
+            dupl_mask_ = ~X.index.duplicated(keep='last')
+
+        if not dupl_mask_.all():
             warnings.warn(
                 "Inputs have duplicated indices. Only one of each row with duplicated indices will be kept.")
-        
-        if fit:
-            self.dupl_mask_ = larray(dupl_mask_)
-        
-        if y is not None:
-            if not X.index.equals(y.index):
-                raise ValueError("X, y do not have the same indices.")
-            
-        # This will (probably) remove duplicates in original X, y
-            return X[~dupl_mask_], y[~dupl_mask_]
-        else:
-            return X[~dupl_mask_]
-        
-    def process_data(self, X, y=None,  
-                     fit=True, 
+
+        return dupl_mask_
+
+    def process_data(self, X, y=None,
+                     fit=True,
                      check_data=True,
                      remove_NA=True,
                      remove_duplicates=True,
                      copy=True, **check_params):
 
         if fit:
-            self.features_ = X.columns
+            self.train_features_cols_ = X.columns
         elif not self.processor_fitted_:
             raise NotProcessedError(self)
-        
+
         X_ = X
         y_ = y
         if copy:
@@ -155,17 +222,17 @@ class GeoMagARXProcessor():
                 y_ = y_.copy()
 
         if check_data:
-            self.check_data(X_, y_, fit=fit, check_vx_col=self.propagate, 
-                check_same_cols=(not fit), **check_params)
-        # elif copy and y_ is not None:
-        #     X_ = X.copy()
-        #     y_ = y.copy()
-        # elif copy and y_ is None:
-        #     X_ = X.copy()
-        
+            self.check_data(X_, y_, fit=fit, check_vx_col=self.propagate,
+                            check_same_cols=(not fit), **check_params)
+
         if remove_duplicates:
-            X_, y_ = self._remove_duplicates(X_, y_, fit=fit)
-            
+            self.dupl_mask_ = self._compute_duplicate_time_mask(X_, fit=fit)
+            X_ = X_[self.dupl_mask_]
+            if y is not None:
+                y_ = y_[self.dupl_mask_]
+        else:
+            self.dupl_mask_ = np.array([True]*X_.shape[0])
+
         if y_ is not None:
             data_ = pd.concat([y_, X_], axis=1)
         elif self.auto_order == 0:
@@ -176,11 +243,13 @@ class GeoMagARXProcessor():
         if fit:
             # - Set feature processor as attribute and fit it
             # - Set target processor as attribute, fit and transform y
-            
+
             # Fit feature processor
-            self.feature_processor_ = FeatureProcessor(
+            self.feature_processor_ = ARXFeatureProcessor(
                 auto_order=self.auto_order,
                 exog_order=self.exog_order,
+                include_interactions=self.include_interactions,
+                interactions_degree=self.interactions_degree,
                 time_resolution=self.time_resolution,
                 transformer=self.transformer_X)
             self.feature_processor_.fit(
@@ -213,12 +282,13 @@ class GeoMagARXProcessor():
 
             self.processor_fitted_ = True
         elif y is not None and self.transformer_y is not None:
-            # Don't transform y_ 
+            # Don't transform y_
             y_ = self.transformer_y.transform(
-                y_.to_numpy().reshape(-1,1)).flatten()
+                y_.to_numpy().reshape(-1, 1)).flatten()
 
         # Use feature_processor that was fit previously.
         X_ = self.feature_processor_.transform(data_)
+        # Doesn't change shape of X_
 
         if fit:
             # Align X_ with y_
@@ -227,74 +297,40 @@ class GeoMagARXProcessor():
                 target_mask = np.logical_and(
                     target_mask, self.propagation_time_processor_.mask_)
             X_ = X_[target_mask]
-        
+
         if remove_NA:
-            mask = _get_NA_mask(X_, y_, mask_y=fit)
-            X_ = X_[mask]
-            
+            na_mask = _get_NA_mask(X_, y_, mask_y=fit)
+            X_ = X_[na_mask]
+
             if y is not None:
-                y_ = y_[mask]
-        
+                y_ = y_[na_mask]
+
         if fit:
-            self.train_features_ =  X_
+            self.train_features_ = X_
             self.train_target_ = y_
-        
+
+        # Get storms of training data
+        if fit and isinstance(X.index, pd.MultiIndex):
+            input_storms = X.index.get_level_values(
+                level=self.storm_level)
+            self.train_storms_ = input_storms[self.dupl_mask_][target_mask][na_mask]
+
         return X_, y_
-    
-    def _check_processor_fitted(self, check_lazy=True):
-        if not self.processor_fitted_:
-            raise NotProcessedError(self)
-        if check_lazy and not self.lazy:
-            raise ValueError("self.lazy must be True.")
-    
-    @property
-    def train_features_(self):
-        if self.lazy:
-            return self.train_features__.evaluate()
-        else:
-            return self.train_features__
-    
-    @train_features_.setter
-    def train_features_(self, train_features_):
-        if self.lazy:
-            self.train_features__ = larray(train_features_)
-        else:
-            self.train_features__ = train_features_
-            
-    @property
-    def train_target_(self):
-        if self.lazy:
-            return self.train_target__.evaluate()
-        else:
-            return self.train_target__
-    
-    @train_target_.setter
-    def train_target_(self, train_target_):
-        if self.lazy:
-            self.train_target__ = larray(train_target_)
-        else:
-            self.train_target__ = train_target_
-            
-    @property
-    def train_shape_(self):
-        self._check_processor_fitted(check_lazy=False)
-        return self.train_features__.shape
-        
-    
-    def process_predictions(self, ypred, Vx=None, 
-                             inverse_transform_y=True, copy=True):
+
+    def process_predictions(self, ypred, Vx=None,
+                            inverse_transform_y=True, copy=True):
         ypred_ = ypred
         if copy:
             if isinstance(ypred_, (np.ndarray, pd.Series, pd.DataFrame)):
                 ypred_ = ypred_.copy()
             elif isinstance(ypred_, torch.Tensor):
                 ypred_ = ypred_.clone()
-        
+
         if self.transformer_y is not None and inverse_transform_y:
             check_is_fitted(self.target_processor_.transformer)
             ypred_ = self.target_processor_.transformer.inverse_transform(
                 ypred_.reshape(-1, 1)).flatten()
-            ypred_ = pd.Series(ypred_, index = ypred.index)
+            ypred_ = pd.Series(ypred_, index=ypred.index)
         # elif isinstance(ypred_, torch.Tensor):
         #     ypred_ = ypred_.numpy()
         # else:
@@ -317,13 +353,13 @@ class GeoMagARXProcessor():
                 Vx_ = Vx_.copy()
             elif isinstance(Vx_, torch.Tensor):
                 Vx_ = Vx_.clone()
-        
+
         test_target_processor = TargetProcessor(
             pred_step=self.pred_step,
             time_resolution=self.time_resolution)
         Vx_ = test_target_processor.fit_transform(
             Vx_, storm_level=self.storm_level, time_level=self.time_level)
-            
+
         test_prop_time_processor = PropagationTimeProcessor(
             Vx=Vx_,
             time_resolution=self.time_resolution,
@@ -335,151 +371,306 @@ class GeoMagARXProcessor():
         pred_times = test_prop_time_processor.propagated_times[mask]
 
         if isinstance(Vx.index, pd.MultiIndex):
-            ypred_ = pd.Series(ypred_[mask], 
+            ypred_ = pd.Series(ypred_[mask],
                                index=[pred_times.index, pred_times])
         else:
             ypred_ = pd.Series(ypred_[mask], index=pred_times)
-        
-        # Remove duplicate indices that may have resulted from 
+
+        # Remove duplicate indices that may have resulted from
         # processing propagation time
-        ypred_ = self._remove_duplicates(ypred_, fit=False)
+        dupl_mask = self._compute_duplicate_time_mask(ypred_, fit=False)
+        ypred_ = ypred_[dupl_mask]
         # BUG: This breaks down if we have more than one testing storm. Fix later.
-        
+
         return ypred_
-    
+
     def _predict_persistence(self, y, Vx=None):
         if isinstance(y.index, pd.MultiIndex):
-            ypred = y.groupby(level=self.storm_level_).apply(
-                lambda x: x.unstack(level=self.storm_level_).shift(
+            ypred = y.groupby(level=self.storm_level).apply(
+                lambda x: x.unstack(level=self.storm_level).shift(
                     periods=self.pred_step, freq='T'
                 )
             )
         else:
             ypred = y.shift(periods=self.pred_step, freq='T')
-        
+
         if self.propagate:
             pers_prop_time_processor = PropagationTimeProcessor(
-                Vx=Vx.reindex(ypred.index).dropna(), 
+                Vx=Vx.reindex(ypred.index).dropna(),
                 time_resolution=self.time_resolution,
                 D=self.D)
             pers_prop_time_processor = pers_prop_time_processor.fit(
-                ypred, storm_level=self.storm_level, 
+                ypred, storm_level=self.storm_level,
                 time_level=self.time_level)
             mask = pers_prop_time_processor.mask_
-            prop_times = pers_prop_time_processor.propagated_times[mask] 
-            
+            prop_times = pers_prop_time_processor.propagated_times[mask]
+
             if isinstance(y.index, pd.MultiIndex):
                 ypred = pd.Series(
                     ypred.values.flatten()[mask],
                     index=[prop_times.index, prop_times],
-                    )
+                )
             else:
                 ypred = pd.Series(
-                    ypred.values[mask], 
+                    ypred.values[mask],
                     index=prop_times.values)
-            
-            ypred = self._remove_duplicates(ypred, fit=False)
-            
-        return ypred
-    
-    def _plot_one_storm(self, storm_idx, y, ypred, X=None,
-                        ypred_persistence=None, lower=None, upper=None, display_info=False, figsize=(10, 7), 
-                        model_name=None, sw_to_plot=None, **more_info):
 
+            dupl_mask = self._compute_duplicate_time_mask(ypred, fit=False)
+            ypred = ypred[dupl_mask]
+
+        return ypred
+
+    def _plot_one_storm(self, storm_idx, y, ypred, X=None,
+                        ypred_persistence=None, lower=None, upper=None, display_info=False, figsize=(10, 7),
+                        model_name=None, sw_to_plot=None, time_range=None,
+                        min_ticks=10, interactive=False, **more_info):
+
+        y_ = y[storm_idx]
+        ypred_ = ypred[storm_idx]
+        X_ = X.loc[storm_idx]
+        ypred_persistence_ = ypred_persistence[storm_idx]
+
+        # Get prediction label
+        rmse = mse_masked(y, ypred, squared=False, round=True)
+        pred_label = 'Prediction'
+        if self.propagate or self.pred_step > 0:
+            pred_label = pred_label + ' ('
+        if self.propagate:
+            pred_label = pred_label + 'propagated'
+        if self.pred_step > 0:
+            if self.propagate:
+               pred_label = pred_label + ', '
+                
+            pred_label = pred_label+str(self.pred_step) + 'min. ahead'
+        if self.propagate or self.pred_step > 0:
+            pred_label = pred_label + ')'
+        pred_label = pred_label + ' [RMSE: '+str(rmse)+']'
+
+        info = 'Storm #'+str(storm_idx)+": " + \
+            'auto_order='+str(self.auto_order)+'min, ' + \
+            'exog_order='+str(self.exog_order)+'min'
+
+        if self.include_interactions:
+            info = info + ', ' + \
+                str(self.interactions_degree) + '-way interactions'
+
+        if model_name is not None:
+            info = info + ' [Model: ' + model_name + ']'
+
+        if len(more_info) != 0:
+            info = info + ' ('
+            i = 0
+            for param, value in more_info.items():
+                info = info + param + '=' + str(value)
+                if i != len(more_info)-1:
+                    info = info + ', '
+                    i = i + 1
+            info = info + ')'
+        
+        if ypred_persistence is not None:
+            rmse_persistence = mse_masked(y_, ypred_persistence_,
+                                          squared=False, round=True)
+
+            persistence_label = 'Persistence [RMSE: ' + \
+                str(rmse_persistence)+']'
+        
         if sw_to_plot is not None:
             if X is None:
-                raise ValueError("X needs to be specified if sw_to_plot is specified.")
+                raise ValueError(
+                    "X needs to be specified if sw_to_plot is specified.")
+
+            n_sw_to_plot = len(sw_to_plot)            
+
+        features_text = 'Features: '+', '.join(self.train_features_cols_)
+
+        if interactive:
+            from plotly.subplots import make_subplots
+            import plotly.graph_objects as go            
             
-            n_sw_to_plot = len(sw_to_plot)
-            fig, ax = plt.subplots(nrows=n_sw_to_plot+1, 
-                                   ncols=1,
-                                   sharex=True,
-                                   figsize=figsize,
-                                   gridspec_kw={
-                                       'height_ratios':[4]+[1]*n_sw_to_plot})
-            ax0 = ax[0]
+            if sw_to_plot is not None:
+                fig = make_subplots(rows=len(sw_to_plot)+1, cols=1, 
+                                    row_heights=[4]+[1]*n_sw_to_plot,
+                                    shared_xaxes=True,
+                                    vertical_spacing=0.02)
+            else:
+                fig = go.Figure()
+            
+            # hovertemplate =  'Time: %{x}' + '<br>value: %{y:.2f}'
+            
+            # Plot truth
+            fig.add_trace(go.Scatter(x=y_.index, y=y_,
+                                     mode='lines', 
+                                     name='Truth',
+                                     line=dict(color='black', width=1),
+                                    #  hovertemplate=hovertemplate,
+                                     ),
+                          row=1, col=1
+                          )
+            
+            # Plot predictions
+            fig.add_trace(go.Scatter(x=ypred_.index, y=ypred_,
+                                     mode='lines',
+                                     name=pred_label,
+                                     line=dict(color='red', width=1),
+                                    #  hovertemplate=hovertemplate,
+                                     ),
+                          row=1, col=1
+                          )
+            
+            # Plot persistence predictions
+            fig.add_trace(go.Scatter(x=ypred_persistence_.index,
+                                     y=ypred_persistence_,
+                                     mode='lines',
+                                     name=persistence_label,
+                                     line=dict(color='blue', width=1),
+                                    #  hovertemplate=hovertemplate,
+                                     ),
+                          row=1, col=1
+                          )
+            
+            fig.update_yaxes(showline=True, 
+                             linewidth=.8, 
+                             linecolor='black', 
+                             row=1, col=1)
+            fig.update_xaxes(showline=True, 
+                             linewidth=.8, 
+                             linecolor='black', 
+                             row=1, col=1)
+            
+            if sw_to_plot is not None:
+                for i in range(n_sw_to_plot):
+                    X_sw_i = X_[sw_to_plot[i]]
+                    fig.add_trace(go.Scatter(x=X_sw_i.index, 
+                                             y=X_sw_i,
+                                             mode='lines',
+                                             name=sw_to_plot[i],
+                                             line=dict(color='black',width=1),
+                                             showlegend=False,
+                                            #  hovertemplate=hovertemplate,
+                                             ),
+                                  row=i+2, col=1
+                                  )
+                    fig.update_yaxes(title_text=sw_to_plot[i],
+                                     showline=True,
+                                     linewidth=.8,
+                                     linecolor='black', 
+                                     row=i+2, col=1)
+                    fig.update_xaxes(showline=True,
+                                     linewidth=.8,
+                                     linecolor='black', 
+                                     row=i+2, col=1)
+            
+            fig.update_layout(height=650, width=850, 
+                              margin=go.layout.Margin(
+                                  l=30, r=30, b=50, t=50),
+                              title=dict(
+                                  text=info
+                                  ),
+                              legend=dict(
+                                  x=0,
+                                  y=-0.12,
+                                  orientation='h',
+                                  xanchor='left',
+                                  yanchor='bottom',
+                                  font=dict(
+                                      size=10,
+                                      )
+                                  ),
+                              template="plotly_white",
+                              hovermode="x unified",
+                              annotations=[
+                                  # Show features used.
+                                  dict(
+                                      x=0,
+                                      y=1.03,
+                                      showarrow=False,
+                                      xref="paper",
+                                      yref="paper",
+                                      text=features_text,
+                                      font=dict(
+                                          size=10,
+                                      )
+                                  )
+                              ]
+                              )
+            return fig, None
+
         else:
-            fig, ax = plt.subplots(sharex=True,
-                                   figsize=figsize)
-            ax0 = ax
-        
-        ### Plot truth
-        # y_.unstack(level=self.storm_level).plot(label='Truth', color='black', linewidth=0.5, ax=ax0)
-        ax0.plot(y[storm_idx], 
-                 label='Truth', color='black', linewidth=0.5)
-        
-        ### Plot predictions
-        rmse = mse_masked(y, ypred, squared=False, round=True)
-    
-        # Get prediction label
-        pred_label = ''
-        if self.propagate:
-            pred_label = pred_label + 'Propagated '
-        if self.pred_step > 0:
-            pred_label = pred_label + str(self.pred_step) + 'min. ahead '
-        pred_label = pred_label + 'prediction (RMSE: '+ str(rmse)+')'
-        
-        # ypred_.unstack(level=self.storm_level).plot(
-        #     label=pred_label, color='red', linewidth=0.5, ax=ax0)        
-        ax0.plot(ypred[storm_idx], 
-                 label=pred_label, color='red', linewidth=0.5)
+            if sw_to_plot is not None:
+                fig, ax = plt.subplots(nrows=n_sw_to_plot+1,
+                                       ncols=1,
+                                       sharex=True,
+                                       figsize=figsize,
+                                       gridspec_kw={
+                                        'height_ratios': [4]+[1]*n_sw_to_plot})
+                ax0 = ax[0]
+            else:
+                fig, ax = plt.subplots(sharex=True,
+                                       figsize=figsize)
+                ax0 = ax
 
-        if lower is not None and upper is not None:
-            ax0.fill_between(
-                lower.index.get_level_values(level=self.time_level),
-                            lower[storm_idx], upper[storm_idx], 
-                            alpha=0.25, color='red')
+            # Plot truth
+            # y_.unstack(level=self.storm_level).plot(label='Truth', color='black', linewidth=0.5, ax=ax0)
+            ax0.plot(y[storm_idx],
+                     label='Truth', color='black', linewidth=0.5)
 
-        if ypred_persistence is not None:
-                rmse_persistence = mse_masked(y, ypred_persistence, 
-                                            squared=False, round=True)
-                
-                persistence_label = 'Persistence (RMSE: '+str(rmse_persistence)+')'
-                
+            # Plot predictions
+
+            # ypred_.unstack(level=self.storm_level).plot(
+            #     label=pred_label, color='red', linewidth=0.5, ax=ax0)
+            ax0.plot(ypred[storm_idx],
+                     label=pred_label, color='red', linewidth=0.5)
+
+            if lower is not None and upper is not None:
+                ax0.fill_between(
+                    lower.index.get_level_values(level=self.time_level),
+                                lower[storm_idx], upper[storm_idx],
+                    alpha=0.25, color='red',
+
+                    )
+
+            if ypred_persistence is not None:
                 # ypred_persistence.unstack(level=self.storm_level).plot(
                 #     label=persistence_label, color='blue', linestyle='--',
                 #     linewidth=0.5)
                 ax0.plot(ypred_persistence[storm_idx],
-                         label=persistence_label,color='blue', 
+                        label=persistence_label, color='blue', 
                          linestyle='--', linewidth=0.5)
 
-        ax0.legend()
-        # Adjust time scale
-        locator = mdates.AutoDateLocator(minticks=15)
-        formatter = mdates.ConciseDateFormatter(locator)
-        ax0.xaxis.set_major_locator(locator)
-        ax0.xaxis.set_major_formatter(formatter)
+            ax0.legend()
+            # Adjust time scale
+            locator = mdates.AutoDateLocator(minticks=min_ticks)
+            formatter = mdates.ConciseDateFormatter(locator)
+            ax0.xaxis.set_major_locator(locator)
+            ax0.xaxis.set_major_formatter(formatter)
 
-        if display_info:
-            info = 'Storm #'+str(storm_idx)+": " + \
-            'auto_order='+str(self.auto_order)+', ' + \
-            'exog_order='+str(self.exog_order)+' (in min.) '
-            
-            if model_name is not None:
-                info = info + '[Model: ' + model_name + ']'
-            
-            if len(more_info) != 0:
-                info = info + ' ('
-                i = 0
-                for param, value in more_info.items():
-                    info = info + param + '=' + str(value)
-                    if i != len(more_info)-1:
-                        info = info + ', '
-                        i = i + 1
-                info = info + ')'
-            ax0.set_title(info)
-        
-        if sw_to_plot is not None:
-            
-            for i in range(n_sw_to_plot):
-                ax[i+1].plot(X[sw_to_plot[i]][storm_idx], label=sw_to_plot[i], 
-                        color='black', linewidth=0.5)
-                ax[i+1].legend()
-                ax[i+1].xaxis.set_major_locator(locator)
-                ax[i+1].xaxis.set_major_formatter(formatter)
-                       
-            fig.tight_layout()
-        return fig, ax
+            if time_range is not None:
+                time_range_ = [pd.to_datetime(t) for t in time_range]
+                ax0.set_xlim(time_range_)
+
+            if display_info:
+                ax0.set_title(info)
+
+            if sw_to_plot is not None:
+
+                for i in range(n_sw_to_plot):
+                    ax[i+1].plot(X[sw_to_plot[i]][storm_idx], label=sw_to_plot[i],
+                                 color='black', linewidth=0.5)
+                    ax[i+1].legend()
+                    ax[i+1].xaxis.set_major_locator(locator)
+                    ax[i+1].xaxis.set_major_formatter(formatter)
+
+                    if time_range is not None:
+                        ax[i+1].set_xlim(time_range_)
+
+                fig.tight_layout()
+
+            plt.figtext(0.05, 0.008, features_text,
+                        ha='left',
+                        fontsize=12,
+                        fontweight='demibold')
+
+            return fig, ax
 
     def plot_predict(self, y, ypred, X=None,
                      upper=None, lower=None,
@@ -491,6 +682,9 @@ class GeoMagARXProcessor():
                      file_name='prediction_plot.pdf',
                      model_name=None,
                      sw_to_plot=None,
+                     time_range=None,
+                     min_ticks=10,
+                     interactive=False,
                      **more_info):
         # TODO: Need to handle case where y, ypred don't have MultiIndex
 
@@ -506,48 +700,55 @@ class GeoMagARXProcessor():
             idx = pd.IndexSlice
             ypred = ypred.loc[idx[storms_to_plot, :]]
             y = y.loc[idx[storms_to_plot, :]]
-            
+
         if plot_persistence:
             if X is None:
                 raise ValueError("X needs to specified if plot_persistence is True.")
-            
+
             ypred_persistence = self._predict_persistence(
                 y, Vx=X[self.vx_colname])
         else:
             ypred_persistence = None
-            
-        if save:
+
+        if save and not interactive:
             pdf = PdfPages(file_name)
 
         for storm in storms_to_plot:
-
             # rmse = self.score(X.loc[storm], y.loc[storm])
-            fig, ax = self._plot_one_storm(storm,
-                y, ypred, X=X, ypred_persistence=ypred_persistence, 
-                lower=lower, upper=upper, display_info=display_info,
-                figsize=figsize, model_name=model_name, 
-                sw_to_plot=sw_to_plot, **more_info)
+            fig, _ = self._plot_one_storm(
+                storm, y, ypred, X=X, 
+                ypred_persistence=ypred_persistence,
+                lower=lower, upper=upper, display_info=display_info,figsize=figsize, model_name=model_name,
+                sw_to_plot=sw_to_plot, time_range=time_range, min_ticks=min_ticks, interactive=interactive,
+                **more_info)
 
-            if save:
-                pdf.savefig(fig)
+            if not interactive:
+                if save:
+                    pdf.savefig(fig)
+                    pdf.close()
+                else:
+                    plt.show()
             else:
-                plt.show()
+                if save:
+                    fig.write_html(file_name)
 
-        if save:
-            pdf.close()
         return None
 
-    
-class FeatureProcessor(BaseEstimator, TransformerMixin):
+
+class ARXFeatureProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
                  auto_order=60,
                  exog_order=60,
+                 include_interactions=False,
+                 interactions_degree=2,
                  time_resolution='5T',
                  transformer=None,
                  fit_transformer=True,
                  **transformer_params):
         self.auto_order = auto_order
         self.exog_order = exog_order
+        self.include_interactions = include_interactions
+        self.interactions_degree = interactions_degree
         self.time_resolution = time_resolution
         self.transformer = transformer
         self.fit_transformer = fit_transformer
@@ -559,6 +760,18 @@ class FeatureProcessor(BaseEstimator, TransformerMixin):
         if self.transformer is not None:
             self.transformer = self.transformer.set_params(
                 **self.transformer_params)
+
+            if self.include_interactions:
+                self.transformer = make_pipeline(
+                    PolynomialFeatures(degree=self.interactions_degree,
+                                       interaction_only=True,
+                                       include_bias=False),
+                    self.transformer)
+        elif self.include_interactions:
+            self.transformer = PolynomialFeatures(
+                degree=self.interactions_degree,
+                interaction_only=True,
+                include_bias=False)
 
         self.target_column_ = target_column
         self.storm_level_ = storm_level
@@ -614,8 +827,10 @@ class FeatureProcessor(BaseEstimator, TransformerMixin):
             X_, y_, self.auto_order_timesteps_,
             [self.exog_order_timesteps_]*X_.shape[1],
             [0]*X_.shape[1])
+
         lagged_features = p.generate_lag_features()
         return lagged_features
+
 
 class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
@@ -628,77 +843,6 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
         self.D = D
         self.lazy = lazy
 
-    def _compute_propagated_time(self, x):
-        return (x['time'] + pd.Timedelta(x['prop_time'], unit='sec')).floor(freq=self.time_resolution)
-
-    def _compute_times(self, storm_level=0, time_level=1):
-        propagation_in_sec_ = self.D / self.Vx.abs()
-        propagation_in_sec_.rename("prop_time", inplace=True)
-
-        if isinstance(propagation_in_sec_.index, pd.MultiIndex):
-            propagation_in_sec_.index.rename(
-                names='time', level=time_level, inplace=True)
-            propagated_times_ = propagation_in_sec_.reset_index(
-                level=time_level).apply(self._compute_propagated_time, axis=1)
-        else:
-            propagation_in_sec_.index.rename('time', inplace=True)
-            propagated_times_ = propagation_in_sec_.reset_index().apply(
-                self._compute_propagated_time, axis=1)
-            propagated_times_.rename('times', inplace=True)
-        
-        self.propagation_in_sec = propagation_in_sec_
-        self.propagated_times = propagated_times_
-
-        return None
-    
-    def _compute_mask(self, X, time_level=1):
-        # Get mask of where propagated times are in X's time index
-        if isinstance(X.index, pd.MultiIndex):
-            X_times = X.index.get_level_values(level=time_level)
-            proptime_in_X_mask = np.in1d(self.propagated_times, X_times)
-        else:
-            proptime_in_X_mask = np.in1d(self.propagated_times, X.index)
-
-        # Get mask of where propagated times are duplicated
-        dupl_mask = self.propagated_times.duplicated(keep='last').values
-        mask = np.logical_and(proptime_in_X_mask, ~dupl_mask)
-        return mask
-
-    def fit(self, X, y=None, storm_level=0, time_level=1):
-
-        if self.Vx is None:
-            raise ValueError("Vx must be specified.")
-        elif not isinstance(self.Vx, pd.Series):
-            raise TypeError("Vx must be a pd.Series (for now).")
-        
-        self.storm_level_ = storm_level
-        self.time_level_ = time_level
-
-        if X.shape[0] != self.Vx.shape[0]:
-            # Reindex Vx to have same index as X
-            self.Vx = self.Vx.reindex(X.index)
-
-        self._compute_times(storm_level=storm_level,
-                            time_level=time_level)
-        self.mask_ = self._compute_mask(X, time_level=self.time_level_)
-
-        return self
-        
-    def transform(self, X, y=None):
-        check_is_fitted(self)
-
-        if self.Vx is not None:
-            if isinstance(X.index, pd.MultiIndex):
-                storms = X.index.get_level_values(level=self.storm_level_)
-                return X.reindex(
-                    [storms[self.mask_], self.propagated_times[self.mask_]]
-                )
-            else:
-                return X.reindex(
-                    [self.mask_])
-        else:
-            return X
-    
     @property
     def propagation_in_sec(self):
         if self.lazy:
@@ -716,21 +860,21 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
             return self.propagation_in_sec_
 
     @propagation_in_sec.setter
-    def propagation_in_sec(self, propagation_in_sec):        
+    def propagation_in_sec(self, propagation_in_sec):
         if self.lazy:
             if isinstance(propagation_in_sec, (pd.DataFrame, pd.Series)):
                 # Save index and index names to recreate pd object later.
                 self.propagation_in_sec_idx_names_ = propagation_in_sec.index.names
                 self.propagation_in_sec_idx_ = larray(propagation_in_sec.index)
-                
+
             self.propagation_in_sec_ = larray(propagation_in_sec)
         else:
             self.propagation_in_sec_ = propagation_in_sec
-            
+
     @property
     def propagated_times(self):
         if self.lazy:
-            # Reconstruct series 
+            # Reconstruct series
             df = pd.Series(self.propagated_times_.evaluate())
             if len(self.propagated_times_idx_names_) > 1:
                 df.index = pd.MultiIndex.from_tuples(
@@ -753,6 +897,78 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
             self.propagated_times_ = larray(propagated_times)
         else:
             self.propagated_times_ = propagated_times
+
+    def _compute_propagated_time(self, x):
+        return (x['time'] + pd.Timedelta(x['prop_time'], unit='sec')).floor(freq=self.time_resolution)
+
+    def _compute_times(self, storm_level=0, time_level=1):
+        propagation_in_sec_ = self.D / self.Vx.abs()
+        propagation_in_sec_.rename("prop_time", inplace=True)
+
+        if isinstance(propagation_in_sec_.index, pd.MultiIndex):
+            propagation_in_sec_.index.rename(
+                names='time', level=time_level, inplace=True)
+            propagated_times_ = propagation_in_sec_.reset_index(
+                level=time_level).apply(self._compute_propagated_time, axis=1)
+        else:
+            propagation_in_sec_.index.rename('time', inplace=True)
+            propagated_times_ = propagation_in_sec_.reset_index().apply(
+                self._compute_propagated_time, axis=1)
+            propagated_times_.rename('times', inplace=True)
+
+        self.propagation_in_sec = propagation_in_sec_
+        self.propagated_times = propagated_times_
+
+        return None
+
+    def _compute_mask(self, X, time_level=1):
+        # Get mask of where propagated times are in X's time index
+        if isinstance(X.index, pd.MultiIndex):
+            X_times = X.index.get_level_values(level=time_level)
+            proptime_in_X_mask = np.in1d(self.propagated_times, X_times)
+        else:
+            proptime_in_X_mask = np.in1d(self.propagated_times, X.index)
+
+        # Get mask of where propagated times are duplicated
+        dupl_mask = self.propagated_times.duplicated(keep='last').values
+        mask = np.logical_and(proptime_in_X_mask, ~dupl_mask)
+        return mask
+
+    def fit(self, X, y=None, storm_level=0, time_level=1):
+
+        if self.Vx is None:
+            raise ValueError("Vx must be specified.")
+        elif not isinstance(self.Vx, pd.Series):
+            raise TypeError("Vx must be a pd.Series (for now).")
+
+        self.storm_level_ = storm_level
+        self.time_level_ = time_level
+
+        if X.shape[0] != self.Vx.shape[0]:
+            # Reindex Vx to have same index as X
+            self.Vx = self.Vx.reindex(X.index)
+
+        self._compute_times(storm_level=storm_level,
+                            time_level=time_level)
+        self.mask_ = self._compute_mask(X, time_level=self.time_level_)
+
+        return self
+
+    def transform(self, X, y=None):
+        check_is_fitted(self)
+
+        if self.Vx is not None:
+            if isinstance(X.index, pd.MultiIndex):
+                storms = X.index.get_level_values(level=self.storm_level_)
+                return X.reindex(
+                    [storms[self.mask_], self.propagated_times[self.mask_]]
+                )
+            else:
+                return X.reindex(
+                    [self.mask_])
+        else:
+            return X
+
 
 class TargetProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
@@ -809,49 +1025,3 @@ class TargetProcessor(BaseEstimator, TransformerMixin):
         mask = np.in1d(self.times_to_predict_, X_times)
 
         return mask
-
-def _pd_fit(transformer, X, y=None, **transformer_fit_params):
-    if transformer is not None:
-        if isinstance(X, pd.Series):
-            X_np = X.to_numpy().reshape(-1, 1)
-            return transformer.fit(X_np, **transformer_fit_params)
-        elif isinstance(X, pd.DataFrame):
-            return transformer.fit(X, **transformer_fit_params)
-        else:
-            raise TypeError(
-                "_pd_fit is meant to only take in pandas objects as input.")
-    else:
-        return None
-
-def _pd_transform(transformer, X, y=None):
-    if transformer is not None:
-        if isinstance(transformer, Pipeline):
-            # Check each step of Pipeline
-            for step in transformer.steps:
-                check_is_fitted(step[1])
-        else:
-            check_is_fitted(transformer)
-
-        if isinstance(X, pd.Series):
-            # Need to reshape
-            X_transf = transformer.transform(
-                X.to_numpy().reshape(-1, 1)).flatten()
-            X_transf = pd.Series(X_transf, index=X.index)
-        elif isinstance(X, pd.DataFrame):
-            X_transf = transformer.transform(X)
-            X_transf = pd.DataFrame(X_transf, index=X.index)
-        else:
-            raise TypeError(
-                "_pd_transform is meant to only take in pandas objects as input.")
-
-        return X_transf
-    else:
-        # Do nothing
-        return X
-
-class NotProcessedError(Exception):
-    def __init__(self, obj):
-        self.class_name = obj.__class__.__name__
-        self.message = "Data have not been previously processed using process_data in " + \
-            self.class_name+". Please call"+self.class_name + \
-            ".process_data with fit=True first."
