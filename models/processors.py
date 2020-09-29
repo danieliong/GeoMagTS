@@ -423,7 +423,7 @@ class GeoMagARXProcessor():
     def _plot_one_storm(self, storm_idx, y, ypred, X=None,
                         ypred_persistence=None, lower=None, upper=None, display_info=False, figsize=(10, 7),
                         model_name=None, sw_to_plot=None, time_range=None,
-                        min_ticks=10, interactive=False, **more_info):
+                        min_ticks=10, interactive=False, y_orig=None, **more_info):
 
         y_ = y[storm_idx]
         ypred_ = ypred[storm_idx]
@@ -528,6 +528,18 @@ class GeoMagARXProcessor():
                           row=1, col=1
                           )
             
+            if y_orig is not None:
+                fig.add_trace(go.Scatter(x=y_orig[storm_idx].index,
+                                         y=y_orig[storm_idx],
+                                         mode='lines',
+                                         name='Original',
+                                         line=dict(color='gray',width=1),
+                                         visible='legendonly',
+                                         ),
+                              row=1, col=1,
+                              )
+            
+            # Add lines for axis
             fig.update_yaxes(showline=True, 
                              linewidth=.8, 
                              linecolor='black', 
@@ -537,6 +549,7 @@ class GeoMagARXProcessor():
                              linecolor='black', 
                              row=1, col=1)
             
+            # Plot solar wind parameters
             if sw_to_plot is not None:
                 for i in range(n_sw_to_plot):
                     X_sw_i = X_[sw_to_plot[i]]
@@ -564,7 +577,8 @@ class GeoMagARXProcessor():
                               margin=go.layout.Margin(
                                   l=30, r=30, b=50, t=50),
                               title=dict(
-                                  text=info
+                                  text=info,
+                                  font=dict(size=12),
                                   ),
                               legend=dict(
                                   x=0,
@@ -685,6 +699,7 @@ class GeoMagARXProcessor():
                      time_range=None,
                      min_ticks=10,
                      interactive=False,
+                     y_orig=None,
                      **more_info):
         # TODO: Need to handle case where y, ypred don't have MultiIndex
 
@@ -720,7 +735,7 @@ class GeoMagARXProcessor():
                 ypred_persistence=ypred_persistence,
                 lower=lower, upper=upper, display_info=display_info,figsize=figsize, model_name=model_name,
                 sw_to_plot=sw_to_plot, time_range=time_range, min_ticks=min_ticks, interactive=interactive,
-                **more_info)
+                y_orig=y_orig, **more_info)
 
             if not interactive:
                 if save:
