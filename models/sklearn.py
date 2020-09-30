@@ -11,7 +11,7 @@ from functools import wraps, partial
 from sklearn.utils import safe_mask
 from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
 from sklearn.linear_model import LinearRegression, Lasso, LassoLars, LassoCV, LassoLarsCV
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, GridSearchCV
 from sklearn.utils.estimator_checks import check_estimator
 from sklearn.utils.validation import check_is_fitted, check_X_y, check_array, check_consistent_length
 from sklearn.metrics import mean_squared_error, make_scorer
@@ -19,6 +19,7 @@ from sklearn.pipeline import Pipeline
 from pandas.tseries.frequencies import to_offset
 from sklearn.preprocessing import PolynomialFeatures
 from scipy.stats import norm
+import joblib
 
 from GeoMagTS.models.processors import GeoMagARXProcessor, NotProcessedError, requires_processor_fitted
 from GeoMagTS.utils import _get_NA_mask
@@ -55,7 +56,7 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
             D=D, storm_level=storm_level,
             time_level=time_level,
             lazy=lazy)
-
+        
         self.base_estimator = base_estimator.set_params(**estimator_params)
         self.estimator_params = estimator_params
 
@@ -111,6 +112,53 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
         self.base_estimator_fitted_.fit(features, target, **fit_args)
 
         return self
+
+    def fit_cv(self, X, y, param_grid=None, 
+               storm_level=0, time_level=1, 
+               vx_colname='vx_gse', n_splits=5,
+               save=False, load=False, 
+               file_name='cv.pkl', **kwargs):
+        
+        if save is True and load is True:
+            raise ValueError("save and load can't both be True.")
+        
+        if not load and param_grid is None:
+            raise ValueError("param_grid must be specified if load is False.")
+        
+        self._prefit(
+            storm_level=storm_level,
+            time_level=time_level,
+            vx_colname=vx_colname
+        )
+        features, target = self.process_data(X, y, fit=True)
+        
+        if load:
+            self.gridsearch_cv_ = joblib.load(file_name)
+        else:
+            self.gridsearch_cv_ = GridSearchCV(
+                self.base_estimator, param_grid=param_grid, 
+                cv=GroupKFold(n_splits=n_splits), refit=False, **kwargs)
+            self.gridsearch_cv_.fit(features, target, 
+                                    groups=self.train_storms_)
+            
+        if save:
+            joblib.dump(self.gridsearch_cv_, file_name)
+            
+        self.base_estimator_fitted_.set_params(
+            **self.gridsearch_cv_.best_params_)
+        features, target = self.process_data(X, y, fit=True)
+        self.base_estimator_fitted_.fit(features, target)
+        self.cv_is_fitted_ = True
+        
+        return self
+    
+    def load_cv(self, cv_file):
+        self.gridsearch_cv_ = joblib.load(cv_file)
+        self.base_estimator_fitted_.set_params(
+            **self.gridsearch_cv_.best_params_)
+        self.cv_is_fitted_ = True
+        return None 
+        
 
     def predict(self, X, y=None, **predict_params):
         # y can only be None if self.auto_order == 0
@@ -397,7 +445,7 @@ class GeoMagLinearARX(GeoMagARXRegressor):
 
         self.cv_is_fitted_ = True
 
-        return None
+        return self
 
 # class GeoMagGP(GeoMagTSRegressor):
 #     def __init__(self, **params):
