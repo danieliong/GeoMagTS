@@ -1,8 +1,8 @@
+from os import path
 import torch
 import numpy as np
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
-from GeoMagTS.utils import MetaLagFeatureProcessor, _get_NA_mask, _pd_fit, _pd_transform, mse_masked
 
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted, check_X_y, check_array
@@ -18,6 +18,11 @@ from lazyarray import larray
 from cached_property import cached_property
 import functools
 from functools import wraps, partial
+import joblib
+
+from GeoMagTS.utils import MetaLagFeatureProcessor, _get_NA_mask, _pd_fit, _pd_transform, mse_masked, _check_file_name
+
+# NOTE: Get rid of sklearn-transformers?
 
 
 def requires_processor_fitted(method):
@@ -47,6 +52,7 @@ class GeoMagARXProcessor():
                  transformer_y=None,
                  include_interactions=False,
                  interactions_degree=2,
+                 seasonality=False,
                  propagate=True,
                  vx_colname='vx_gse',
                  time_resolution='5T',
@@ -54,6 +60,41 @@ class GeoMagARXProcessor():
                  storm_level=0,
                  time_level=1,
                  lazy=True):
+        """Process geomagnetic data for fitting autoregressive models
+
+        Parameters
+        ----------
+        auto_order : int, optional
+            Autoregressive order in minutes, by default 60
+        exog_order : int, optional
+            Exogeneous order in minutes, by default 60
+        pred_step : int, optional
+            Prediction step in minutes, by default 0
+        transformer_X : sklearn.Transformer, optional
+            Scikit-learn transformer for feature variables, by default None
+        transformer_y : sklearn.Transformer, optional
+            Scikit-learn transformer for target variable, by default None
+        include_interactions : bool, optional
+            If true, include interaction terms, by default False
+        interactions_degree : int, optional
+            If include_interactions is true, the degree of interactions, by default 2
+        seasonality : bool, optional
+            If true, include terms to account for day and year seasonality, by default False
+        propagate : bool, optional
+            If true, propagate time for target variable, by default True    
+        vx_colname : str, optional
+            Name of column for Vx, solar wind velocity, by default 'vx_gse'
+        time_resolution : str, datetime.timedelta, or pandas.DateOffset, optional
+            Time resolution, by default '5T'
+        D : int, optional
+            Distance from Earth to spacecraft that measures solar wind, by default 1500000
+        storm_level : int, optional
+            Index level of storms in data, by default 0
+        time_level : int, optional
+            Index level of time in data, by default 1
+        lazy : bool, optional
+            If true, save lazy evaluated arrays, by default True
+        """        
         self.auto_order = auto_order
         self.exog_order = exog_order
         self.pred_step = pred_step
@@ -61,11 +102,13 @@ class GeoMagARXProcessor():
         self.transformer_y = transformer_y
         self.include_interactions = include_interactions
         self.interactions_degree = interactions_degree
+        self.seasonality = seasonality
         self.propagate = propagate
         self.vx_colname = vx_colname
 
         # FIXME: This shouldn't be input.
         self.time_resolution = time_resolution
+        
         self.D = D
         self.storm_level = storm_level
         self.time_level = time_level
@@ -73,8 +116,36 @@ class GeoMagARXProcessor():
         self.processor_fitted_ = False
 
     @property
+    def time_res_minutes_(self):
+        """
+        Time resolution in minutes
+        """    
+        return to_offset(self.time_resolution).delta.seconds / 60
+
+    @property
+    def auto_order_steps_(self):   
+        """
+        Autoregressive order time-step
+        """     
+        return np.rint(self.auto_order / self.time_res_minutes_).astype(int)
+
+    @property
+    def exog_order_steps_(self):
+        """
+        Autoregressive order time-step
+        """     
+        return np.rint(self.exog_order / self.time_res_minutes_).astype(int)
+
+    @property
     @requires_processor_fitted
     def interactions_processor_(self):
+        """Scikit-learn PolynomialFeatures transformer for creating interaction terms 
+
+        Returns
+        -------
+        sklearn.Transformer
+            PolynomialFeatures transformer 
+        """        
         if self.include_interactions:
             if self.transformer_X is not None:
                 return self.feature_processor_.transformer['polynomialfeatures']
@@ -86,6 +157,9 @@ class GeoMagARXProcessor():
     @property
     @requires_processor_fitted
     def train_features_(self):
+        """
+        Features data used for training 
+        """        
         if self.lazy:
             return self.train_features__.evaluate()
         else:
@@ -101,6 +175,9 @@ class GeoMagARXProcessor():
     @property
     @requires_processor_fitted
     def train_target_(self):
+        """
+        Target data used for training 
+        """
         if self.lazy:
             return self.train_target__.evaluate()
         else:
@@ -116,6 +193,9 @@ class GeoMagARXProcessor():
     @property
     @requires_processor_fitted
     def train_storms_(self):
+        """
+        Storms used for training 
+        """        
         if self.lazy:
             return self.train_storms__.evaluate()
         else:
@@ -149,7 +229,42 @@ class GeoMagARXProcessor():
 
     def check_data(self, X, y=None, fit=True, check_multi_index=True,
                    check_vx_col=True, check_same_cols=False, check_same_indices=True, **sklearn_check_params):
+        """Input validation for data
 
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Features data
+        y : pd.Series, optional
+            Target data, by default None
+        fit : bool, optional
+            If True, check data used for fitting, by default True
+        check_multi_index : bool, optional
+            If True, check if index is a MultiIndex, by default True
+        check_vx_col : bool, optional
+            If True, check if X contains a column named self.vx_colname, by default True
+        check_same_cols : bool, optional
+            If True, check if X has columns self.train_features_cols_, by default False
+        check_same_indices : bool, optional
+            If True, check if X and y have same indices, by default True
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------            
+        ValueError
+            y is not specified (if fit is True), X has a MultiIndex with only
+            one level, X does not contain column named self.vx_colname (if
+            check_vx_col is True), X does not have columns
+            self.train_features_cols_ (if check_same_cols is True), or X does not
+            have same indices as y (if check_same_indices is True)
+        TypeError
+            X is not a pandas object, X does not have a MultiIndex (if
+            check_multi_index) or DatetimeIndex, or y is not a pandas object (if y
+            is not None)
+        """        
         # Check without converting to np arrays
         _ = check_X_y(X, y, y_numeric=True, **sklearn_check_params)
 
@@ -189,7 +304,19 @@ class GeoMagARXProcessor():
 
         return None
 
-    def _compute_duplicate_time_mask(self, X, fit=True):
+    def _compute_duplicate_time_mask(self, X):
+        """Compute mask for duplicated time in X 
+
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Feature data_
+
+        Returns
+        -------
+        np.ndarray of boolean values
+            Mask for times that aren't duplicates
+        """        
         if isinstance(X.index, pd.MultiIndex):
             dupl_mask_ = ~X.index.get_level_values(
                 level=self.time_level).duplicated(keep='last')
@@ -208,6 +335,39 @@ class GeoMagARXProcessor():
                      remove_NA=True,
                      remove_duplicates=True,
                      copy=True, **check_params):
+        """Process data for fitting AR-X models to geomagnetic data
+
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Feature data
+        y : pd.Series, optional
+            Target data, by default None
+        fit : bool, optional
+            Process data for model fitting if true and for prediction if false, by default True
+        check_data : bool, optional
+            If True, perform input validation for data, by default True
+        remove_NA : bool, optional
+            If True, remove NA values, by default True
+        remove_duplicates : bool, optional
+            If True, remove duplicate times, by default True
+        copy : bool, optional
+            If True, create deep copies of data, by default True
+
+        Returns
+        -------
+        tuple of np.ndarray
+            Tuple of numpy arrays with columns containing autoregressive and
+            lagged exogeneous terms to be used as features and target in
+            regression model
+
+        Raises
+        ------
+        NotProcessedError
+            If fit is False (process data for prediction) and self.processor_fitted_ is False
+        ValueError
+            y is not specified and self.auto_order is non-zero.
+        """        
 
         if fit:
             self.train_features_cols_ = X.columns
@@ -250,6 +410,7 @@ class GeoMagARXProcessor():
                 exog_order=self.exog_order,
                 include_interactions=self.include_interactions,
                 interactions_degree=self.interactions_degree,
+                seasonality=self.seasonality,
                 time_resolution=self.time_resolution,
                 transformer=self.transformer_X)
             self.feature_processor_.fit(
@@ -278,7 +439,7 @@ class GeoMagARXProcessor():
             else:
                 self.propagation_time_processor_ = None
 
-            # BUG: lengths of X_, y_ differ when pred_step > 0
+            # BUG: lengths of X_, y_ may differ when pred_step > 0
 
             self.processor_fitted_ = True
         elif y is not None and self.transformer_y is not None:
@@ -319,6 +480,24 @@ class GeoMagARXProcessor():
 
     def process_predictions(self, ypred, Vx=None,
                             inverse_transform_y=True, copy=True):
+        """Process predictions: perform inverse transform if y was transformed,compute corresponding times for predictions 
+
+        Parameters
+        ----------
+        ypred : np.ndarray
+            Predictions
+        Vx : array-like, optional
+            Solar wind speed used for computing propagation time, by default None
+        inverse_transform_y : bool, optional
+            if True, perform inverse transform, by default True
+        copy : bool, optional
+            if True, create deep copies, by default True
+
+        Returns
+        -------
+        pd.Series
+            Processed predictions
+        """        
         ypred_ = ypred
         if copy:
             if isinstance(ypred_, (np.ndarray, pd.Series, pd.DataFrame)):
@@ -330,7 +509,7 @@ class GeoMagARXProcessor():
             check_is_fitted(self.target_processor_.transformer)
             ypred_ = self.target_processor_.transformer.inverse_transform(
                 ypred_.reshape(-1, 1)).flatten()
-            ypred_ = pd.Series(ypred_, index=ypred.index)
+            # ypred_ = pd.Series(ypred_, index=ypred.index)
         # elif isinstance(ypred_, torch.Tensor):
         #     ypred_ = ypred_.numpy()
         # else:
@@ -406,10 +585,11 @@ class GeoMagARXProcessor():
             prop_times = pers_prop_time_processor.propagated_times[mask]
 
             if isinstance(y.index, pd.MultiIndex):
+                # BUG: Breaks down when there are > 1 test storms.
                 ypred = pd.Series(
                     ypred.values.flatten()[mask],
                     index=[prop_times.index, prop_times],
-                )
+                    )
             else:
                 ypred = pd.Series(
                     ypred.values[mask],
@@ -701,6 +881,54 @@ class GeoMagARXProcessor():
                      interactive=False,
                      y_orig=None,
                      **more_info):
+        """Plotting method for predictions
+
+        Parameters
+        ----------
+        y : pd.Series
+            Original target
+        ypred : pd.Series
+            Predicted y
+        X : pd.DataFrame, optional
+            Dataframe containing features to be plotted, by default None
+        upper : pd.Series, optional
+            Upper level for prediction, by default None
+        lower : pd.Series, optional
+            Lower level for prediction, by default None
+        plot_persistence : bool, optional
+            If True, plot line for prediction for persistence model, by default True
+        storms_to_plot : array-like, optional
+            Storms to plot, by default None (plot all)
+        display_info : bool, optional
+            If True, display information about predictions in title, by default False
+        figsize : tuple, optional
+            figsize in plt.plot, by default (15, 10)
+        save : bool, optional
+            If True, save plot, by default True
+        file_name : str, optional
+            Name of file that plot is saved to, by default 'prediction_plot.pdf'
+        model_name : str, optional
+            Name of model to shown, by default None
+        sw_to_plot : list of str, optional
+            Names of solar wind parameters to plot, by default None
+        time_range : list of str or pd.Timestamp, optional
+            List of length 2 containing start and end time to plot, by default None
+        min_ticks : int, optional
+            min_ticks in mdates.AutoDateLocator, by default 10
+        interactive : bool, optional
+            If True, use plot_ly, by default False
+        y_orig : pd.Series, optional
+            Original unsmoothed y, by default None
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            X is not specified and plot_persistence is True
+        """        
         # TODO: Need to handle case where y, ypred don't have MultiIndex
 
         storms_to_plot = y.index.unique(level=self.storm_level)
@@ -724,6 +952,11 @@ class GeoMagARXProcessor():
                 y, Vx=X[self.vx_colname])
         else:
             ypred_persistence = None
+
+        if interactive:
+            file_name = _check_file_name(file_name, ['html'])
+        else:
+            file_name = _check_file_name(file_name, ['pdf'])
 
         if save and not interactive:
             pdf = PdfPages(file_name)
@@ -749,6 +982,24 @@ class GeoMagARXProcessor():
 
         return None
 
+    def save(self, file_name, valid_ext=['pkl'], **kwargs):
+        """Save object 
+
+        Parameters
+        ----------
+        file_name : str
+            Name of file
+        valid_ext : list, optional
+            List of valid extensions, by default ['pkl']
+
+        Returns
+        -------
+        None
+        """        
+        file_name = _check_file_name(file_name, valid_ext=valid_ext)    
+        joblib.dump(self, file_name, **kwargs)
+        return None 
+
 
 class ARXFeatureProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
@@ -756,6 +1007,7 @@ class ARXFeatureProcessor(BaseEstimator, TransformerMixin):
                  exog_order=60,
                  include_interactions=False,
                  interactions_degree=2,
+                 seasonality=False,
                  time_resolution='5T',
                  transformer=None,
                  fit_transformer=True,
@@ -764,6 +1016,7 @@ class ARXFeatureProcessor(BaseEstimator, TransformerMixin):
         self.exog_order = exog_order
         self.include_interactions = include_interactions
         self.interactions_degree = interactions_degree
+        self.seasonality = seasonality
         self.time_resolution = time_resolution
         self.transformer = transformer
         self.fit_transformer = fit_transformer
@@ -843,9 +1096,19 @@ class ARXFeatureProcessor(BaseEstimator, TransformerMixin):
             [self.exog_order_timesteps_]*X_.shape[1],
             [0]*X_.shape[1])
 
-        lagged_features = p.generate_lag_features()
-        return lagged_features
-
+        features = p.generate_lag_features()
+        
+        if self.seasonality:
+            yr_term = ((2*np.pi*times.dayofyear)/365).to_numpy().reshape(-1,1)
+            day_term = ((2*np.pi*times.hour)/24).to_numpy().reshape(-1,1)
+            sin_yr = np.sin(yr_term)
+            cos_yr = np.cos(yr_term)
+            sin_day = np.sin(day_term)
+            cos_day = np.cos(day_term)
+            features = np.concatenate(
+                (features, sin_yr, cos_yr, sin_day, cos_day), axis=1)
+            
+        return features
 
 class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
@@ -983,7 +1246,6 @@ class PropagationTimeProcessor(BaseEstimator, TransformerMixin):
                     [self.mask_])
         else:
             return X
-
 
 class TargetProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
