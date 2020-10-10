@@ -26,7 +26,6 @@ from GeoMagTS.utils import _get_NA_mask
 
 # NOTE: Converting to pandas from np slowed down the code significantly
 
-
 class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
     def __init__(self,
                  base_estimator=None,
@@ -37,6 +36,7 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
                  transformer_y=None,
                  include_interactions=False,
                  interactions_degree=2,
+                 seasonality=False,
                  propagate=True,
                  time_resolution='5T',
                  D=1500000,
@@ -51,6 +51,7 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
             transformer_y=transformer_y,
             include_interactions=include_interactions,
             interactions_degree=interactions_degree,
+            seasonality=seasonality,
             propagate=propagate,
             time_resolution=time_resolution,
             D=D, storm_level=storm_level,
@@ -59,18 +60,6 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
         
         self.base_estimator = base_estimator.set_params(**estimator_params)
         self.estimator_params = estimator_params
-
-    @property
-    def time_res_minutes_(self):
-        return to_offset(self.time_resolution).delta.seconds / 60
-
-    @property
-    def auto_order_steps_(self):
-        return np.rint(self.auto_order / self.time_res_minutes_).astype(int)
-
-    @property
-    def exog_order_steps_(self):
-        return np.rint(self.exog_order / self.time_res_minutes_).astype(int)
 
     def _prefit(self, copy=True, **kwargs):
 
@@ -117,7 +106,8 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
                storm_level=0, time_level=1, 
                vx_colname='vx_gse', n_splits=5,
                save=False, load=False, 
-               file_name='cv.pkl', **kwargs):
+               file_name='cv.pkl',
+                **kwargs):
         
         if save is True and load is True:
             raise ValueError("save and load can't both be True.")
@@ -159,7 +149,6 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
         self.cv_is_fitted_ = True
         return None 
         
-
     def predict(self, X, y=None, **predict_params):
         # y can only be None if self.auto_order == 0
         check_is_fitted(self)
@@ -177,13 +166,10 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
 
         return ypred
 
-    def score(self, X, y, metric=mean_squared_error,
+    def score(self, X, y, metric=mean_squared_error, 
               negative=True, squared=False, decimals=None):
 
-        if persistence:
-            y_pred = self._predict_persistence(X, y)
-        else:
-            y_pred = self.predict(X, y)
+        y_pred = self.predict(X, y)
 
         score = self.score_func(y, y_pred, metric=metric,
                                 squared=squared)
@@ -207,7 +193,6 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
                 'no_validation': True}
 
 # estimator_checks = check_estimator(GeoMagTSRegressor())
-
 
 def not_implemented_for_lasso(method):
     @wraps(method)
@@ -330,6 +315,11 @@ class GeoMagLinearARX(GeoMagARXRegressor):
         check_is_fitted(self)
         coef_df = self._format_df(self.coef_)
         return coef_df
+    
+    @cached_property
+    def train_errors(self):
+        yhat = self.predict(self.train_features_)
+        return (self.train_target_ - yhat)
 
     @not_implemented_for_lasso
     def compute_prediction_se(self, X, y=None, squared=False):
@@ -367,7 +357,7 @@ class GeoMagLinearARX(GeoMagARXRegressor):
                          }
         return pred_interval
 
-    def _format_df(self, vals, include_interactions=True, decimals=3):
+    def _format_df(self, vals, decimals=3):
         ar_names = np.array(
             ["ar"+str(i) for i in range(self.auto_order_steps_)]
         )
@@ -385,7 +375,7 @@ class GeoMagLinearARX(GeoMagARXRegressor):
              }
         )
 
-        if vals.shape[0] > len(names) and include_interactions:
+        if vals.shape[0] > len(names) and self.include_interactions:
 
             powers = self.interactions_processor_.powers_
             n_features = self.train_features_cols_.shape[0]
@@ -399,7 +389,7 @@ class GeoMagLinearARX(GeoMagARXRegressor):
                  for x in interaction_colnames]
             )
             interactions = pd.Series(
-                vals[len(names):],
+                vals[len(names):len(names)+len(interaction_names)],
                 index=interaction_names
             )
             interactions_df = pd.DataFrame(
@@ -408,8 +398,16 @@ class GeoMagLinearARX(GeoMagARXRegressor):
                  }
             )
             df = pd.concat([df, interactions_df], axis=1)
+            
+        if self.seasonality:
+            seasonality_names = ('sin_yr','cos_yr','sin_day','cos_day')
+            seasonality_df = pd.DataFrame(
+                {seasonality_names[i]: [vals[-i]]
+                 for i in range(len(seasonality_names))}
+                )
+            df = pd.concat([df, seasonality_df], axis=1)
 
-        # Set index to minutes lag
+            # Set index to minutes lag
         df.set_index(
             np.arange(0, self.exog_order,
                       step=self.time_res_minutes_).astype(int),
