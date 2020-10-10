@@ -30,22 +30,22 @@ class GeoMagDataProcessor():
         """        
         self.data_file = data_file 
 
-        if self.data_file is not None and self.data is not None:
+        if self.data_file is not None and data is not None:
             raise ValueError(
                 "Only one of data_file and data can be specified.")
-        elif self.data_file is None and self.data is None:
+        elif self.data_file is None and data is None:
             raise ValueError(
                 "One of data_file and data must be specified."
             )
             
-        self.time_resolution = self._check_time_resolution(infer_freq=True)
-
         if self.data_file is not None:
             self.read_data_kwargs = kwargs 
             self.data = _read_data(data_file, **self.read_data_kwargs)
         else:
             self.data = data
         # elif self.data is not None:
+        
+        self.time_resolution = self._check_time_resolution(infer_freq=True)
         
         # Attributes to keep track of processing steps
         self.columns_selected = False
@@ -354,8 +354,8 @@ class GeoMagDataProcessor():
     
     def train_test_split(self, test_storms=None,
                          min_threshold=None,
-                         test_size=None, data=None, 
-                         return_dict=True, **kwargs):
+                         test_size=None, data=None,
+                         return_dict=True, seed=None, **kwargs):
         """Split self.data into training and testing set. 
         
         There are several options for how to split the data. You can either
@@ -373,12 +373,14 @@ class GeoMagDataProcessor():
         test_size : int or float, optional
             If < 1, it will be considered a percentage. If > 1, it will be
             considered as the number of test storms, by default None
-        data : , pandas.DataFrame   
+        data : pandas.DataFrame, optional
             Data to split, by default self.data
         return_dict : bool, optional
         Return two dictionaries for training and test with keys 'X' and 'y', by
         default True. If False, return tuples with entries X_train, y_train,
         X_test, y_test
+        seed : int, optional
+            Random seed for generating test indices, by default None 
 
         Returns
         -------
@@ -403,6 +405,6 @@ class GeoMagDataProcessor():
             test_storms=test_storms,
             min_threshold=min_threshold,
             test_size=test_size, return_dict=return_dict, 
-            **kwargs)
+            seed=seed, **kwargs)
         split_data = storm_splitter.fit_transform(data)
         return split_data
