@@ -4,6 +4,7 @@ import pandas as pd
 
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
+from pandas.tseries.frequencies import to_offset
 
 from ..utils import get_storm_indices
 
@@ -34,7 +35,6 @@ class DataFrameSelector(BaseEstimator, TransformerMixin):
         else:
             return X[self.column_names]
 
-
 class TimeResolutionResampler(BaseEstimator, TransformerMixin):
     def __init__(self, time_resolution='5T', func=np.mean):
         """Changes time resolution of data
@@ -54,7 +54,6 @@ class TimeResolutionResampler(BaseEstimator, TransformerMixin):
 
     def transform(self, X, y=None):
         return X.resample(self.time_resolution).apply(self.func)
-
 
 class MovingAverageSmoother(BaseEstimator, TransformerMixin):
     def __init__(self,
@@ -76,7 +75,7 @@ class MovingAverageSmoother(BaseEstimator, TransformerMixin):
         self.storm_level_ = storm_level
         self.time_level_ = time_level
 
-        self.window_freq_ = str(self.window) + 'T'
+        self.window_freq_ = to_offset(str(self.window) + 'T')
 
         if isinstance(X.index, pd.MultiIndex):
             times = X.index.get_level_values(level=self.time_level_)
@@ -113,12 +112,11 @@ class MovingAverageSmoother(BaseEstimator, TransformerMixin):
 
         if self.method == 'simple':
             x[self.target_column_] = x[self.target_column_].rolling(
-                self.window_freq_, on=times, **self.kwargs).apply(self.func)
+                window=self.window_freq_, on=times, **self.kwargs).apply(self.func)
         else:
             raise TypeError(self.method+" is not implemented (yet).")
 
         return x
-
 
 class StormsProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
@@ -201,15 +199,15 @@ class StormsProcessor(BaseEstimator, TransformerMixin):
         else:
             return X
 
-
 class StormSplitter(BaseEstimator, TransformerMixin):
     def __init__(self,
                  test_storms=None,
                  min_threshold=None,
-                 test_size=1,
+                 test_size=None,
                  storm_level=0,
                  target_column='sym_h',
-                 return_dict=False):
+                 return_dict=False,
+                 seed=None):
         # TODO: Input validation
         self.test_storms = test_storms
         self.min_threshold = min_threshold
@@ -217,6 +215,7 @@ class StormSplitter(BaseEstimator, TransformerMixin):
         self.storm_level = storm_level
         self.target_column = target_column
         self.return_dict = return_dict
+        self.seed = seed
 
     def fit(self, X, y=None):
         # TODO: Input validation
@@ -226,8 +225,17 @@ class StormSplitter(BaseEstimator, TransformerMixin):
             y = X[self.target_column]
             
         self.storm_labels_ = y.index.unique(level=self.storm_level)
+        self.n_storms_ = len(self.storm_labels_)
 
         if self.test_storms is None:
+            
+            if self.test_size is None:
+                raise ValueError(
+                    "test_size must be specified if test_storms is not specified.")
+            elif self.test_size < 1:
+                np.random.seed(self.seed)
+                self.test_size = np.ceil(
+                    self.n_storms_ * self.test_size).astype(int)
 
             if self.min_threshold is None:
                 self.test_storms_ = np.random.choice(
@@ -267,14 +275,6 @@ class StormSplitter(BaseEstimator, TransformerMixin):
         else:
             test_idx = pd.IndexSlice[self.test_storms, :]
         train_idx = pd.IndexSlice[self.train_storms_, :]
-
-        # Return dictionary?
-        # data = {
-        #     'X_train': X.iloc[train_idx],
-        #     'y_train': y.iloc[train_idx],
-        #     'X_test': X.iloc[test_idx],
-        #     'y_test': y.iloc[test_idx]
-        # }
         
         X_train, y_train = X_.loc[train_idx, :], y_.loc[train_idx]
         X_test, y_test = X_.loc[test_idx, :], y_.loc[test_idx]
@@ -294,61 +294,3 @@ class StormSplitter(BaseEstimator, TransformerMixin):
             return self.train_storms_, self.test_storms_
         else:
             return self.train_storms, self.test_storms_
-
-# @lru_cache(maxsize=None)
-# def prepare_geomag_data(data_file, storm_times_file,
-#                         test_storms=None,
-#                         min_threshold=None,
-#                         test_size=1,
-#                         time_resolution='5T',
-#                         target_column='sym_h',
-#                         feature_columns=('bz', 'vx_gse', 'density'),
-#                         storms_to_delete=(15, 69, 124),
-#                         start='2000',
-#                         end='2030',
-#                         split_train_test=True,
-#                         smooth_method=None,
-#                         smooth_window=30):
-
-#     if test_storms is None and min_threshold is None:
-#         raise ValueError(
-#             "Either test_storms or min_threshold must be specified. Specify only one and try again."
-#         )
-#     elif test_storms is not None and min_threshold is not None:
-#         raise ValueError(
-#             "test_storms and min_threshold cannot both be specified. Specify only one and try again."
-#         )
-
-#     data = pd.read_pickle(data_file)
-#     storm_times_df = pd.read_pickle(storm_times_file)
-
-#     # Data processing pipeline for entire dataframe
-#     column_selector = DataFrameSelector((target_column,)+feature_columns)
-#     time_res_resampler = TimeResolutionResampler(time_resolution)
-#     storms_processor = StormsProcessor(storm_times_df=storm_times_df,
-#                                        storms_to_delete=storms_to_delete, start=start,
-#                                        end=end)
-
-#     pipeline_transformers = [
-#         ("selector", column_selector),
-#         ("resampler", time_res_resampler),
-#         ("processor", storms_processor)
-#     ]
-
-#     if smooth_method is not None:
-#         smoother = MovingAverageSmoother(method=smooth_method,
-#                                          window=smooth_window,
-#                                          time_resolution=time_resolution)
-#         pipeline_transformers.append(
-#             ('smoother', smoother))
-
-#     if split_train_test:
-#         storm_splitter = StormSplitter(test_storms=test_storms,
-#                                        min_threshold=min_threshold, test_size=test_size)
-#         pipeline_transformers.append(
-#             ("splitter", storm_splitter))
-
-#     data_pipeline = Pipeline(pipeline_transformers)
-#     processed_data = data_pipeline.fit_transform(data)
-
-#     return processed_data
