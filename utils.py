@@ -1,3 +1,4 @@
+from os import path
 import keras
 import pandas as pd
 import numpy as np
@@ -155,6 +156,27 @@ def find_storms(data, times, storm_times_df=None, date_only=True):
         get_storms_at_time(times)          
         
     return storms
+
+def _check_file_name(file_name, valid_ext=None):
+    import re
+    name, ext = file_name.split('.')
+    
+    if valid_ext is not None and ext not in valid_ext:
+        valid_ext_str = ', '.join(valid_ext)
+        raise ValueError("File extension must be "+valid_ext_str+".")         
+    
+    if path.exists(file_name):
+        name_search = re.search('\d+$', name)
+        if name_search is not None:
+            name = name_search.re.split(name)[0]
+            num = str(int(name_search.group())+1)
+            name = name + num
+        else:
+            name = name + '2'
+        
+        file_name = name + '.' + ext
+    
+    return file_name
 
 def get_storm_indices(data, stormtimes_df, 
                       include_storms=None, time_resolution='5T'):
