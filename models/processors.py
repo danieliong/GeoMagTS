@@ -386,7 +386,7 @@ class GeoMagARXProcessor():
                             check_same_cols=(not fit), **check_params)
 
         if remove_duplicates:
-            self.dupl_mask_ = self._compute_duplicate_time_mask(X_, fit=fit)
+            self.dupl_mask_ = self._compute_duplicate_time_mask(X_)
             X_ = X_[self.dupl_mask_]
             if y is not None:
                 y_ = y_[self.dupl_mask_]
@@ -557,7 +557,7 @@ class GeoMagARXProcessor():
 
         # Remove duplicate indices that may have resulted from
         # processing propagation time
-        dupl_mask = self._compute_duplicate_time_mask(ypred_, fit=False)
+        dupl_mask = self._compute_duplicate_time_mask(ypred_)
         ypred_ = ypred_[dupl_mask]
         # BUG: This breaks down if we have more than one testing storm. Fix later.
 
@@ -595,7 +595,7 @@ class GeoMagARXProcessor():
                     ypred.values[mask],
                     index=prop_times.values)
 
-            dupl_mask = self._compute_duplicate_time_mask(ypred, fit=False)
+            dupl_mask = self._compute_duplicate_time_mask(ypred)
             ypred = ypred[dupl_mask]
 
         return ypred
