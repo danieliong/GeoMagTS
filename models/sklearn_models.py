@@ -1,18 +1,15 @@
 import numpy as np
 import pandas as pd
 import warnings
-import sys
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_pdf import PdfPages
 from cached_property import cached_property
 from functools import wraps, partial
 
-from sklearn.utils import safe_mask
-from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
+from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.linear_model import LinearRegression, Lasso, LassoLars, LassoCV, LassoLarsCV
 from sklearn.model_selection import GroupKFold, GridSearchCV
-from sklearn.utils.estimator_checks import check_estimator
 from sklearn.utils.validation import check_is_fitted, check_X_y, check_array, check_consistent_length
 from sklearn.metrics import mean_squared_error, make_scorer
 from sklearn.pipeline import Pipeline
