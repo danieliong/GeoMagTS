@@ -1,3 +1,5 @@
 /.git
 /__pycache__
+/data_processing/__pycache__
+/models/__pycache__
 /models_old.py
