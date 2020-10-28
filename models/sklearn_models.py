@@ -17,6 +17,7 @@ from pandas.tseries.frequencies import to_offset
 from sklearn.preprocessing import PolynomialFeatures
 from scipy.stats import norm
 import joblib
+import time
 
 from GeoMagTS.models.processors import GeoMagARXProcessor, NotProcessedError, requires_processor_fitted
 from GeoMagTS.utils import _get_NA_mask
@@ -40,6 +41,7 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
                  storm_level=0,
                  time_level=1,
                  lazy=True,
+                 verbose=False,
                  **estimator_params):
         super().__init__(
             exog_order=exog_order,
@@ -55,6 +57,7 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
             time_level=time_level,
             lazy=lazy)
         
+        self.verbose = verbose
         self.base_estimator = base_estimator.set_params(**estimator_params)
         self.estimator_params = estimator_params
 
@@ -92,10 +95,25 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
             vx_colname=vx_colname,
         )
 
+        if self.verbose:
+            start_time = time.time()
+            
         features, target = self.process_data(X, y, fit=True)
+        
+        if self.verbose:
+            run_time = time.time() - start_time
+            print("[Fit] Data processing took {:.0f} seconds.".format(run_time))
+
+        if self.verbose:
+            start_time = time.time()
 
         # Fit base estimator
         self.base_estimator_fitted_.fit(features, target, **fit_args)
+        
+        if self.verbose:
+            run_time = time.time() - start_time
+            print(
+                "[Fit] Fitting "+self.base_estimator.__str__()+" took {:.0f} seconds.".format(run_time))
 
         return self
 
@@ -150,16 +168,39 @@ class GeoMagARXRegressor(RegressorMixin, BaseEstimator, GeoMagARXProcessor):
         # y can only be None if self.auto_order == 0
         check_is_fitted(self)
 
+        if self.verbose:
+            start_time = time.time()
+            
         X_, y = self.process_data(X, y, fit=False,
                                   remove_NA=False)
         nan_mask = _get_NA_mask(X_)
         test_features = X_[nan_mask]
+        
+        if self.verbose:
+            run_time = time.time() - start_time
+            print("[Predict] Test data processing took {:.0f} seconds.".format(run_time))
+
+        if self.verbose:
+            start_time = time.time()
 
         ypred = self.base_estimator_fitted_.predict(
             test_features, **predict_params)
-
+        
+        if self.verbose:
+            run_time = time.time() - start_time
+            print(
+                "[Predict] Predict took {:.0f} seconds.".format(run_time))
+            
+        if self.verbose:
+            start_time = time.time()
+        
         ypred = self.process_predictions(
             ypred, Vx=X[self.vx_colname][nan_mask])
+        
+        if self.verbose:
+            run_time = time.time() - start_time
+            print(
+                "[Predict] Processing predictions took {:.0f} seconds.".format(run_time))
 
         return ypred
 

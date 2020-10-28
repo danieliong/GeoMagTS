@@ -10,7 +10,7 @@ glmgen_ext = Extension(
     include_dirs=['./glmgen_c/include/', np.get_include()],
     library_dirs=['./glmgen_c/lib/'],
     runtime_library_dirs=['./glmgen_c/lib'],
-    # extra_link_args=['-L./glmgen_c/lib/'],
+    extra_link_args=['-L./glmgen_c/lib/','-headerpad_max_install_names'],
 )
 
 setup(

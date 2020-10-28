@@ -13,7 +13,7 @@ glmgen: $(SETUP) $(PYX)
 	rm -rf build/ glmgen.c
 	install_name_tool -add_rpath GeoMagTS/glmgen_c/lib $(OBJ)
 	install_name_tool -add_rpath ./glmgen_c/lib $(OBJ)
-	install_name_tool -change lib/libglmgen.so @rpath/libglmgen.so
+	install_name_tool -change lib/libglmgen.so @rpath/libglmgen.so $(OBJ)
 
 glmgen_c:
 	make -C $(LIB_DIR) all

@@ -59,7 +59,11 @@ class GeoMagARXProcessor():
                  D=1500000,
                  storm_level=0,
                  time_level=1,
+                 save_train=False,
                  lazy=True):
+        # TODO: Remove lazy. It literally does nothing. 
+        # TODO: Add save_data arg.
+        
         """Process geomagnetic data for fitting autoregressive models
 
         Parameters
@@ -113,7 +117,9 @@ class GeoMagARXProcessor():
         self.storm_level = storm_level
         self.time_level = time_level
         self.lazy = lazy
+        self.save_train = save_train
         self.processor_fitted_ = False
+        
 
     @property
     def time_res_minutes_(self):
@@ -154,64 +160,64 @@ class GeoMagARXProcessor():
         else:
             return None
 
-    @property
-    @requires_processor_fitted
-    def train_features_(self):
-        """
-        Features data used for training 
-        """        
-        if self.lazy:
-            return self.train_features__.evaluate()
-        else:
-            return self.train_features__
+    # @property
+    # @requires_processor_fitted
+    # def train_features_(self):
+    #     """
+    #     Features data used for training 
+    #     """        
+    #     if self.lazy:
+    #         return self.train_features__.evaluate()
+    #     else:
+    #         return self.train_features__
 
-    @train_features_.setter
-    def train_features_(self, train_features_):
-        if self.lazy:
-            self.train_features__ = larray(train_features_)
-        else:
-            self.train_features__ = train_features_
+    # @train_features_.setter
+    # def train_features_(self, train_features_):
+    #     if self.lazy:
+    #         self.train_features__ = larray(train_features_)
+    #     else:
+    #         self.train_features__ = train_features_
 
-    @property
-    @requires_processor_fitted
-    def train_target_(self):
-        """
-        Target data used for training 
-        """
-        if self.lazy:
-            return self.train_target__.evaluate()
-        else:
-            return self.train_target__
+    # @property
+    # @requires_processor_fitted
+    # def train_target_(self):
+    #     """
+    #     Target data used for training 
+    #     """
+    #     if self.lazy:
+    #         return self.train_target__.evaluate()
+    #     else:
+    #         return self.train_target__
 
-    @train_target_.setter
-    def train_target_(self, train_target_):
-        if self.lazy:
-            self.train_target__ = larray(train_target_)
-        else:
-            self.train_target__ = train_target_
+    # @train_target_.setter
+    # def train_target_(self, train_target_):
+    #     if self.lazy:
+    #         self.train_target__ = larray(train_target_)
+    #     else:
+    #         self.train_target__ = train_target_
 
-    @property
-    @requires_processor_fitted
-    def train_storms_(self):
-        """
-        Storms used for training 
-        """        
-        if self.lazy:
-            return self.train_storms__.evaluate()
-        else:
-            return self.train_storms__
+    # @property
+    # @requires_processor_fitted
+    # def train_storms_(self):
+    #     """
+    #     Storms used for training 
+    #     """        
+    #     if self.lazy:
+    #         return self.train_storms__.evaluate()
+    #     else:
+    #         return self.train_storms__
 
-    @train_storms_.setter
-    def train_storms_(self, train_storms_):
-        if self.lazy:
-            self.train_storms__ = larray(train_storms_)
-        else:
-            self.train_storms__ = train_storms_
+    # @train_storms_.setter
+    # def train_storms_(self, train_storms_):
+    #     if self.lazy:
+    #         self.train_storms__ = larray(train_storms_)
+    #     else:
+    #         self.train_storms__ = train_storms_
 
-    @property
-    @requires_processor_fitted
-    def train_shape_(self):
-        return self.train_features__.shape
+    # @property
+    # @requires_processor_fitted
+    # def train_shape_(self):
+    #     return self.train_features__.shape
 
     @property
     def dupl_mask_(self):
@@ -466,15 +472,19 @@ class GeoMagARXProcessor():
             if y is not None:
                 y_ = y_[na_mask]
 
-        if fit:
-            self.train_features_ = X_
-            self.train_target_ = y_
 
         # Get storms of training data
         if fit and isinstance(X.index, pd.MultiIndex):
             input_storms = X.index.get_level_values(
                 level=self.storm_level)
-            self.train_storms_ = input_storms[self.dupl_mask_][target_mask][na_mask]
+            if self.save_train:
+                self.train_storms_ = input_storms[self.dupl_mask_][target_mask][na_mask]
+        
+        y_ = np.array(y_)
+        
+        if fit and self.save_train:
+            self.train_features_ = X_
+            self.train_target_ = y_
 
         return X_, y_
 

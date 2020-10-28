@@ -1,8 +1,10 @@
+from __future__ import print_function
 import numpy as np 
 cimport numpy as np
 from cpython.mem cimport PyMem_Malloc, PyMem_Realloc, PyMem_Free
 from libc.stdlib cimport free 
 from libc.string cimport memcpy 
+from libc.stdio cimport printf
 np.import_array()
 
 # Import data structures from glmgen C library 
@@ -41,6 +43,8 @@ cdef extern from "cs.h":
         csi nb
         csi rr [5]
         csi cc [5]
+    
+    cs *cs_transpose(const cs *A, csi values)
  
 cdef extern from "utils.h":
     ctypedef struct gqr:
@@ -57,6 +61,10 @@ cdef extern from "utils.h":
 	int n, int k, double ** xt, double ** yt,
 	double ** wt, int * nt_ptr, double tol)
     
+    double glmgen_factorial(int n)
+
+    gqr * glmgen_qr(const cs *A)
+
 
 # Import fitting functions from glmgen C library
 cdef extern from "tf.h":
@@ -108,6 +116,25 @@ cdef extern from "tf.h":
     double tf_obj_glm(double * x, double * y, double * w, int n, int k, double
     lam, func_RtoR b, double * beta, double * buf)
 
+def maxlam_tf(np.ndarray x_ord, np.ndarray y_ord, np.ndarray w_ord, int k):
+
+    cdef int n = y_ord.shape[0]
+
+    cdef double[:] x_view = np.ascontiguousarray(x_ord, dtype=np.float64)
+    cdef double[:] y_view = np.ascontiguousarray(y_ord, dtype=np.float64)
+    cdef double[:] w_view = np.ascontiguousarray(w_ord, dtype=np.float64)
+
+    cdef double * x_ptr = &x_view[0]
+    cdef double * y_ptr = &y_view[0]
+    cdef double * w_ptr = &w_view[0]
+
+    cdef cs * D = tf_calc_dk(n, k+1, x_ptr)
+    cdef cs * Dt = cs_transpose(D, 1)
+    cdef gqr * Dt_qr = glmgen_qr(Dt)
+
+    cdef double max_lam = tf_maxlam(n, y_ptr, Dt_qr, w_ptr)
+
+    return max_lam
 
 # Cython wrapper for tf_admm function in the glmgen C library
 def trendfilter(
@@ -122,6 +149,8 @@ def trendfilter(
 
     cdef double[:] lam_view = np.ascontiguousarray(lam, dtype=np.float64)
     cdef double * lam_ptr = &lam_view[0]
+
+    # print("lam: {}".format(lam_view[0]))
 
     cdef double[:] x_view = np.ascontiguousarray(x_ord, dtype=np.float64)
     cdef double[:] y_view = np.ascontiguousarray(y_ord, dtype=np.float64)
@@ -141,7 +170,8 @@ def trendfilter(
 
     # Thinning
     if thinning == 1:
-        thin(&x_view[0], &y_view[0], &w_view[0], n, k, &xt_ptr, &yt_ptr, &wt_ptr, &nt, x_tol)
+        thin(&x_view[0], &y_view[0], &w_view[0], n, k, &xt_ptr, &yt_ptr, 
+        &wt_ptr, &nt, x_tol)
 
     # If data was thinned
     if xt_ptr != NULL:
@@ -177,7 +207,7 @@ def trendfilter(
     # Convert output to numpy arrays 
     cdef np.ndarray df = np.asarray(<int[:nlambda]> df_c)
     cdef np.ndarray f_hat = np.asarray(<double[:nlambda*n]> fhat_c).reshape((nlambda, n))
-    cdef np.ndarray obj = np.asarray(<double[:nlambda*max_iter]> obj_c)
+    cdef np.ndarray obj = np.asarray(<double[:nlambda*max_iter]> obj_c).reshape((nlambda, max_iter))
     cdef np.ndarray iter = np.asarray(<int[:nlambda]> iter_c)
     cdef np.ndarray status = np.asarray(<int[:nlambda]> status_c)
     cdef np.ndarray x_np = np.asarray(<double[:n]> x_ptr) 
@@ -187,12 +217,81 @@ def trendfilter(
 
     return res 
 
-# # solve.prox.tf
-# def proxgrad_iter_tf(y_ord, x_ord, k, lam1, lam2, **tf_kwargs):
-    
-#     cdef int n = y_ord.shape[0]
+def predict_tf(
+    np.ndarray x0, np.ndarray x, np.ndarray beta, int k, int family, 
+    double zero_tol, **kwargs):
 
-#     f_hat = trendfilter(x_ord, y_ord)
+    cdef int n = x.shape[0]
+    cdef int n0 = x0.shape[0]
+
+    cdef double[:] x_view = np.ascontiguousarray(x, dtype=np.float64)
+    cdef double[:] x0_view = np.ascontiguousarray(x0, dtype=np.float64)
+    cdef double[:] beta_view = np.ascontiguousarray(beta, dtype=np.float64)
+    cdef double * x_ptr = &x_view[0]
+    cdef double * x0_ptr = &x0_view[0]
+    cdef double * beta_ptr = &beta_view[0]
+
+    # Allocate space for predictions
+    pred_c = <double*> PyMem_Malloc(n0 * sizeof(double))
+
+    tf_predict(x_ptr, beta_ptr, n, k, family, x0_ptr, n0, pred_c, zero_tol)
+
+    cdef np.ndarray pred = np.asarray(<double[:n0]> pred_c)
+    return pred
+
+def poly_coefs_tf(np.ndarray x, int k, np.ndarray beta):
+
+    cdef double[:] x_view = np.ascontiguousarray(x, dtype=np.float64)
+    cdef double[:] beta_view = np.ascontiguousarray(beta, dtype=np.float64)
+    cdef double * x_ptr = &x_view[0]
+    cdef double * beta_ptr = &beta_view[0]
+
+    # Allocate space for output 
+    coefs_c = <double*> PyMem_Malloc((k+1)*sizeof(double))
+
+    poly_coefs(x_ptr, beta_ptr, k, coefs_c)
+
+    cdef np.ndarray coefs = np.asarray(<double[:k]> coefs_c)
+    return coefs
+
+def falling_fact_coefs_tf(np.ndarray x, int k, np.ndarray beta):
+    
+    cdef int n = x.shape[0]
+    cdef double k_fac
+    cdef double[:] x_view = np.ascontiguousarray(x, dtype=np.float64)
+    cdef double[:] beta_view = np.ascontiguousarray(beta, dtype=np.float64)
+    cdef double * x_ptr = &x_view[0]
+    cdef double * beta_ptr = &beta_view[0]
+
+    coefs_c = <double*> PyMem_Malloc((n-k-1)*sizeof(double))
+
+    tf_dx(x_ptr, n, (k+1), beta_ptr, coefs_c)
+    k_fact = glmgen_factorial(k)
+
+    cdef np.ndarray coefs = np.asarray(<double[:(n-k-1)]> coefs_c)
+    coefs = coefs / k_fact
+
+    return coefs
+
+
+def multiplyD_tf(np.ndarray x, int k, np.ndarray a):
+
+    cdef int n = x.shape[0]
+
+    cdef double[:] x_view = np.ascontiguousarray(x, dtype=np.float64)
+    cdef double * x_ptr = &x_view[0]
+
+    cdef double[:] a_view = np.ascontiguousarray(a, dtype=np.float64)
+    cdef double * a_ptr = &a_view[0]
+
+    b_c = <double*> PyMem_Malloc(n*sizeof(double))
+
+    tf_dx(x_ptr, n, k, a_ptr, b_c)
+
+    cdef np.ndarray b = np.asarray(<double[:n]> b_c)
+    return b
+
+
 
 
 
