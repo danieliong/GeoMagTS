@@ -14,7 +14,7 @@ from collections import deque
 
 # import sys
 # sys.path.insert(0, '..')
-from ..glmgen import trendfilter, predict_tf, poly_coefs_tf, falling_fact_coefs_tf, maxlam_tf  
+from ..glmgen import trendfilter, predict_tf, poly_coefs_tf, falling_fact_coefs_tf, maxlam_tf, multiplyD_tf  
 # from .cv import AdditiveModelCV
 
 
@@ -22,19 +22,21 @@ def t_loss(y, f_hat, intercept, df=10):
     # TODO: Need to figure out how to estimate scale parameter.
     pass
 
+# (1/2) ||y - y_fitted ||^2
 def squared_loss(y: np.ndarray, 
                  fhat: np.ndarray, 
                  intercept:float) -> np.float64:
     y_fitted = np.sum(fhat, axis=-1) + intercept 
     return np.mean((y - y_fitted)**2)/2
 
-def gaussian_grad(y: np.ndarray, 
+# - (y_i - y_i_fitted) 
+def squared_loss_grad(y: np.ndarray, 
                   fhat: np.ndarray, 
                   intercept:float) -> np.ndarray:
     y_fitted = np.sum(fhat, axis=-1) + intercept
     n = y.shape[0]
-    return -(1/n) * (y - y_fitted) 
- 
+    return -1 * (y - y_fitted) 
+     
  
 TF_DEFAULT_KWARGS = dict(
     family=0,
@@ -56,8 +58,8 @@ TF_DEFAULT_KWARGS = dict(
 
 def _admm_tf(x:np.ndarray, 
              y:np.ndarray, *, 
-             lam1:float, 
-             lam2:float, 
+            #  lam1:float, 
+             lam:float, 
              w:Optional[np.ndarray]=None, 
              order:int=2,
              **tf_kwargs) -> Tuple[np.ndarray, float]:
@@ -88,7 +90,7 @@ def _admm_tf(x:np.ndarray,
                          y_ord=y,
                          w_ord=np.ones(n),
                          k=order,
-                         lam=np.array([lam2]).astype(np.float),
+                         lam=np.array([lam]).astype(np.float),
                          **tf_kwargs)
     else:
         w = w[ord]
@@ -96,12 +98,12 @@ def _admm_tf(x:np.ndarray,
                          y_ord=y,
                          w_ord=w,
                          k=order,
-                         lam=np.array([lam2]).astype(np.float),
+                         lam=np.array([lam]).astype(np.float),
                          **tf_kwargs)
     # del y, w
 
     f_hat = tf['f_hat'][0, :]
-    x_thinned = tf['x']
+    # x_thinned = tf['x']
     # del tf
     
     converged = (tf['status'] == 0)
@@ -109,12 +111,14 @@ def _admm_tf(x:np.ndarray,
     if tf['status'] == 1:
         warnings.warn("Trend filter estimates did not converge.")
 
-    if x_thinned.shape[0] != n:
-        f_hat = np.interp(x, xp=x_thinned, fp=f_hat)
+    if tf['x'] is not None:
+        f_hat = np.interp(x, xp=tf['x'], fp=f_hat)
+    # if x_thinned.shape[0] != n:
+    #     f_hat = np.interp(x, xp=x_thinned, fp=f_hat)
     # del x_thinned
     
     # Reorder f_thres to match original order
-    f_new = np.zeros(n)
+    f_new = np.empty(f_hat.shape)
     f_new[ord] = f_hat
 
     return f_new, converged
@@ -130,6 +134,7 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
                  init_fhat: Optional[np.ndarray] = None,
                  init_intercept: Optional[float] = None,
                  max_iter:int = 200,
+                 min_iter:int = 2,
                  tol: float = 1e-4,
                  alpha: float = 0.5, # For line search
                  warm_start: bool = True,
@@ -141,6 +146,7 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
         self.method = method
         self.order = order
         self.max_iter = max_iter
+        self.min_iter = min_iter
         self.tol = tol
         self.alpha = alpha
         self.warm_start = warm_start
@@ -164,10 +170,6 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
     
     # TODO: Validation for loss, method
     
-    # @property
-    # def init_params(self) -> Tuple[float, np.ndarray]:
-    #     return self.init_intercept, self.init_fhat
-    
     @property
     def lam1(self) -> float:
         return self.lam
@@ -187,38 +189,20 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
     def p_active_(self):
         return np.sum(self.active_mask_)
     
-    # GetZ
-    # fhat: n*p matrix
-    # @staticmethod
-    # @classmethod
     def _prox_grad_fixed_step(self,
         X: np.ndarray, 
         grad: np.ndarray, 
-        w:Optional[np.ndarray]=None, *,
-        # f_hat: np.ndarray, 
-        # intercept: float, 
-        # lam1: float, 
-        # lam2: float, 
+        w:Optional[np.ndarray]=None, *, 
         step: float, 
-        # order:int=2, 
-        # method:str='tf',
-        # tf_kwargs:Optional[dict]=None
         ) -> Tuple[float, np.ndarray, np.ndarray]:
         
         start_time = time.time()
         
-        n, p = self.fhat_.shape[0], self.active_mask_.shape[0]
+        n, p = X.shape
         
         intercept_ = self.intercept_ - (step * sum(grad))
         
         active_mask = np.array([False]*p) 
-        
-        # # Convert f_hat to iterator over columns
-        # f_hat_iter = np.nditer(f_hat, flags=['external_loop'], 
-        #                        op_flags=['readonly'], order='F')
-        # Create iterator for computing intermediate step
-        inter_step = ((f - step*grad) for f in self.fhat_.T)
-        # del f_hat
         
         step_grad = step*grad
         del grad
@@ -237,14 +221,12 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
         fhat_ = deque()
                 
         for j, inter_step_j in enumerate(inter_step):
-        # for j, (inter_step_j, x_ord, ord) in enumerate(zip(inter_step, *X_it)):
-            # y_ord = inter_step[ord] - np.mean(inter_step)
             if self.verbose:
                 print("[PG] j = "+str(j))
                 
             if self.method == 'tf':
-                lam1 = (self.lam1*step)/n
-                lam2 = (self.lam2*step)
+                lam1 = n*self.lam1*step
+                lam2 = (n**2)*self.lam2*step
                 
                 order = np.argsort(X[:,j])
                 max_lam = maxlam_tf(
@@ -254,20 +236,21 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
                     k=self.order
                     )
                 
-                if lam2 > max_lam:
-                    step_new = (max_lam / self.lam2)
-                    warnings.warn(
-                        "step*self.lam2 > max_lam = "+str(max_lam)+".")
-                    # converged = False
-                    return intercept_, self.fhat_, self.active_mask_, step_new
+                # # Compute max lambda from ADMM algorithm
+                # if lam2 > max_lam:
+                #     step_new = (max_lam / self.lam2)
+                #     warnings.warn(
+                #         "step*self.lam2 > max_lam = "+str(max_lam)+".")
+                #     # converged = False
+                #     return intercept_, self.fhat_, self.active_mask_, step_new
                 
                 start_time_admm = time.time()
                 
                 f_j, converged = _admm_tf(
                     x=X[:,j], y=inter_step_j, 
                     w=(None if w is None else w[:,j]),
-                    lam1=lam1,
-                    lam2=lam2,
+                    # lam1=lam1,
+                    lam=lam2,
                     order=self.order,
                     **self.tf_kwargs
                     )
@@ -282,7 +265,7 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
                 if f_hat_norm < 1e-100:
                     warnings.warn("f_hat_norm < 1e-100.")
                 
-                thres = max(1 - (lam1 / (f_hat_norm+1e-30)), 0)
+                thres = max(1 - (lam1 / (f_hat_norm+1e-100)), 0)
                 if thres != 0:
                     active_mask[j] = True
                     fhat_.append(thres*f_j)
@@ -297,37 +280,20 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
             print("[PG] Run time: {: .0f} seconds.".format(run_time))
         
         return intercept_, fhat_, active_mask, step
-        # res = namedtuple('res', ['intercept','f','active_mask'])
-        # return cls.prox_grad_results(intercept_, f_hat_, active_mask, None)
-        # return intercept, f_hat, active_mask    
         
-    # LineSearch
-    # @classmethod
     def _prox_grad_line_search(
         self, X:np.ndarray, 
         y:np.ndarray, 
         w:Optional[np.ndarray],
-        # f_hat:np.ndarray, 
-        # intercept:float, 
         step:float,
-        # lam1:float, 
-        # lam2:float, 
-        # alpha:float=0.5, 
-        # order:int=2, 
-        # family:str='gaussian', 
-        # method:str='tf', 
-        # verbose:bool=False, 
-        # tf_kwargs:Optional[dict]=None
         ) -> Tuple[float, np.ndarray, np.ndarray, float]:
         
-        if self.family == 'gaussian':
-            loss = squared_loss(y, self.fhat_, self.intercept_)
-            grad = gaussian_grad(y, self.fhat_, self.intercept_)
+        n, p  = X.shape
         
-        n = y.shape[0]
+        loss = self._loss(y, self.fhat_, self.intercept_)
+        grad = self._grad(y, self.fhat_, self.intercept_)
         
         converged = False
-        # step = self.init_step_size
         iter_ = 1
         
         if self.verbose:
@@ -340,12 +306,6 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
                 print(
                     '[LS] Iteration #: '+str(iter_)+", step size = "+str(step)
                     )
-            
-            # intercept_new, f_new, active_mask = self._prox_grad_fixed_step(
-            #     X, grad, f_hat=self.fhat_, intercept=self.intercept_, 
-            #     lam1=lam1, lam2=lam2, step=step, w=w, 
-            #     order=order, method=method, 
-            #     tf_kwargs=tf_kwargs)
             
             intercept_new, f_new, active_mask, step_ = \
                 self._prox_grad_fixed_step(
@@ -362,25 +322,25 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
                 
                 warnings.warn("Line search will restart with step = max_lam / self.lam2 = "+str(step_)+".")
                 continue 
+                
+            new_loss = self._loss(y, f_new, intercept_new)
             
-            if self.family == 'gaussian':
-                lhs = squared_loss(y, f_new, intercept_new)
-            
-            if not np.isfinite(lhs):
+            if not np.isfinite(new_loss):
                 warnings.warn("New loss is not finite.") 
                 # step = self.alpha * step
-                converged = False
-                self.status = "Updated loss not finite." 
-                # continue
-                return converged, iter_, self.intercept_, self.fhat_, self.active_mask_ 
+                continue
+                # converged = False
+                # self.status = "Updated loss not finite." 
+                # # continue
+                # return converged, iter_, self.intercept_, self.fhat_, self.active_mask_ 
                 
             sum_inner_prod = 0
             # In case predictors are all inactive
             if active_mask.any():
-                sum_inner_prod = sum_inner_prod + np.dot(grad, f_new).sum()
+                sum_inner_prod = sum_inner_prod + np.dot((grad/n), f_new).sum()
             if self.active_mask_.any():
                 sum_inner_prod = sum_inner_prod - np.dot(
-                    grad, self.fhat_).sum()
+                    (grad/n), self.fhat_).sum()
             
             p_active_new = np.sum(active_mask) 
             new_i = iter(range(p_active_new))
@@ -400,33 +360,31 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
                 
                 if not np.isfinite(norm_sq):
                     break 
-            # norm_sq = norm_sq / n 
+            norm_sq = norm_sq / n 
             
             if step < 1e-100:
-                rhs = np.inf
+                maj_term = np.inf
             else:
-                rhs = loss + (sum_grad * (intercept_new - self.intercept_)) + \
+                maj_term = loss + (sum_grad * (intercept_new - self.intercept_)) + \
                     sum_inner_prod + \
                         (1/(2*step)) * (norm_sq + \
                                         (intercept_new - self.intercept_)**2)
             
-            if not np.isfinite(rhs):
+            if not np.isfinite(maj_term):
                 warnings.warn(
                     "Right hand side of majorizing inequality is not finite.")
-                # step = self.alpha * step
                 converged = False
                 self.status_ = "RHS not finite."
                 return converged, iter_, self.intercept_, self.fhat_, self.active_mask_
             
             if self.verbose:
-                # if np.isinf(lhs) or np.isinf(rhs):
-                #     diff = 0 
-                # else:
-                #     diff = (lhs - rhs) 
-                diff = (lhs - rhs)
-                print("[LS] LHS - RHS = "+str(diff))
+                try:
+                    diff = (new_loss - maj_term)
+                    print("[LS] LHS - RHS = "+str(diff))
+                except:
+                    pass 
             
-            if lhs <= rhs:
+            if new_loss <= maj_term:
                 converged = True
                 # self.fhat_ = f_new
                 # self.intercept_ = intercept_new
@@ -454,7 +412,155 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
         
         # return cls.prox_grad_results(intercept_new, f_new, active_mask, step)
         # return converged
-        return converged, iter_, intercept_new, f_new, active_mask  
+        return converged, iter_, intercept_new, f_new, active_mask
+    
+    def _fit_bcd(
+        self, X:np.ndarray, 
+        y:np.ndarray, 
+        w:Optional[np.ndarray]):
+        
+        n, p = X.shape
+        
+        converged = False
+        iter_ = 1
+        
+        r = y
+        
+        if self.verbose:
+            start_time = time.time()
+        
+        self.loss_ = deque([np.inf])
+        
+        while not converged and iter_ <= self.max_iter:
+            if self.verbose:
+                print("[BCD] Iteration #: "+str(iter_)+".")
+                
+            active_mask = np.array([False]*p)
+             
+            # self.intercept_ = np.mean(r)
+            self.intercept_ = np.mean(y)
+            r = r - self.intercept_
+            
+            def r_minus_j_gen():
+                fhat_idx = iter(range(self.p_active_))
+                for j in range(p):
+                    if self.active_mask_[j]:
+                        yield r + self.fhat_[:,next(fhat_idx)]
+                    else:
+                        yield r
+            
+            def gen_res():
+                fhat_idx = iter(range(self.p_active_))
+                for j in range(p):
+                    if self.active_mask_[j]:
+                        sum_minus_j = np.sum(
+                            np.delete(self.fhat_, next(fhat_idx), axis=-1), 
+                            axis=1)
+                        yield (y - np.mean(y)) - sum_minus_j
+                    else:
+                        yield (y - np.mean(y)) - np.sum(self.fhat_, axis=-1)
+                        
+            # order = (np.argsort(x) for x in X.T)
+            # r_minus_j = r_minus_j_gen()
+            res = gen_res()
+            
+            fhat_ = deque()
+            
+            # for j, (ord, r) in enumerate(zip(order, r_minus_j)):
+            # for j, r_ in enumerate(r_minus_j):
+            for j, r in enumerate(res):
+                
+                if self.verbose:
+                    print("[BCD] j = "+str(j))
+                
+                f_inter_, converged = _admm_tf(
+                    x=X[:,j], 
+                    y=(r-np.mean(r)),
+                    w=(None if w is None else w[:,j]),
+                    lam=n*self.lam2, order=self.order,
+                    **self.tf_kwargs)
+                
+                f_inter_norm = np.sqrt(np.mean(f_inter_**2))
+                
+                thres = max(1 - (self.lam1 / ((f_inter_norm)+1e-60)), 0)
+                if thres != 0:
+                    active_mask[j] = True
+                    f_new = thres*f_inter_
+                    fhat_.append(f_new)
+                    # r = r_ + f_new
+                # else:
+                #     r = r_
+            
+            self.fhat_ = np.array(fhat_).T
+            self.active_mask_ = active_mask
+            
+            loss_new = squared_loss(y, self.fhat_, self.intercept_)
+            loss_change = self.loss_[-1] - loss_new
+            
+            self.loss_.append(loss_new)
+            
+            if self.verbose: 
+                print("[BCD] Loss change: "+str(loss_change))
+                
+            if (loss_change <= self.tol) and (loss_change > 0):
+                converged = True
+                if self.verbose:
+                    run_time = time.time() - start_time
+                    print(
+                        "[BCD] Converged. Run time: {: .0f} seconds.".format(run_time))
+                self.status_ = "Converged!"
+            else:
+                iter_ = iter_ + 1
+        
+        if iter_ == self.max_iter:
+            warnings.warn("Max iter. was reached.")
+            self.status_ = "Max iter. reached."
+        
+        self.converged = converged
+        self.n_iter_ = iter_
+            
+        # if self.verbose:
+        #     run_time = time.time() - start_time
+        #     print("[BCD] Run time: {: .0f} seconds.".format(run_time))
+            
+        return None
+            # return intercept_, fhat_, active_mask
+    
+    
+    def _obj(self, X, y, fhat, intercept, active_mask):
+        
+        def l1_norm(arr):
+            return np.sum(np.abs(arr))
+        
+        def struct_norm(x_j, f_j):
+            D_fj = multiplyD_tf(x=x_j, a=f_j, k=(self.order+1))
+            # D_fj sometimes has NaN values.
+            D_fj = np.nan_to_num(D_fj)
+            return l1_norm(D_fj)
+        
+        loss = self._loss(y, fhat, intercept)
+        
+        sparse_pen = 0
+        struct_pen = 0
+        if active_mask.any():
+            sparse_pen = np.sqrt((fhat**2).mean(axis=0)).sum()
+            
+            # struct_pen = sum(struct_norm(x, f) 
+            #                 for x, f in zip(X[:,active_mask].T, fhat.T))
+            for x, f in zip(X[:,active_mask].T, fhat.T):
+                norm = struct_norm(x, f)
+                struct_pen = struct_pen + norm
+                
+        obj = loss + (self.lam1*sparse_pen) + (self.lam2*struct_pen)
+        return obj
+
+    def _loss(self, y, fhat, intercept):
+        if self.family == 'gaussian':
+            return squared_loss(y, fhat, intercept)
+        
+    def _grad(self, y, fhat, intercept):
+        if self.family == 'gaussian':
+            return squared_loss_grad(y, fhat, intercept)    
     
     # Change back to instance method
     # @classmethod
@@ -481,6 +587,8 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
         iter_ = 1
         converged = False
         
+        n, p = X.shape 
+        
         # f_old = self.init_fhat
         # intercept_old = self.init_intercept
         # del init_fhat, init_intercept
@@ -490,19 +598,46 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
 
         self.ls_status_ = [] 
         self.ls_n_iters_ = []
-        # self.rel_changes_ = []
-        self.loss_ = [np.inf]
+        self.rel_changes_ = []
+        self.loss_ = []
+        self.obj_ = []
+        
+        self.loss_.append(self._loss(y, self.fhat_, self.intercept_))
+        self.obj_.append(self._obj(X, y, self.fhat_, self.intercept_, 
+                                   self.active_mask_))
+        if self.verbose:
+            print("Starting loss: "+str(self.loss_[0]))
+            print("Starting obj.: "+str(self.obj_[0]))
+         
+        def compute_rel_change(f_new, intercept_new, active_mask, n):
+            
+            # n = self.fhat_.shape[0]
+            p_active_new = np.sum(active_mask)
+            # p_intersect = np.sum(np.logical_or(active_mask, self.active_mask_))
+            
+            new_i = iter(range(p_active_new))
+            old_i = iter(range(self.p_active_))
+            
+            numer = 0
+            # Conserves memory
+            for i in range(self.p_):
+                if active_mask[i] and self.active_mask_[i]:
+                    numer = numer + np.sum(
+                        (f_new[:, next(new_i)] - self.fhat_[:, next(old_i)])**2
+                    )
+                elif active_mask[i] and not self.active_mask_[i]:
+                    numer = numer + np.sum(f_new[:, next(new_i)]**2)
+                elif not active_mask[i] and self.active_mask_[i]:
+                    numer = numer + np.sum(self.fhat_[:, next(old_i)]**2)
+            numer = (numer / n) + (intercept_new - self.intercept_)**2
+            denom = np.mean(self.fhat_**2) + (self.intercept_**2)
+            rel_change = numer / (denom+1e-100)
+            return rel_change             
+            
         
         while not converged and iter_ <= self.max_iter:
             if self.verbose:
                 print("[Fit] Iteration #: " + str(iter_))
-                # print("------------------------")
-
-            # intercept_new, f_new, active_mask, step = \
-            # intercept_new, f_new, active_mask, _ = \
-            # self._prox_grad_line_search(X, y, 
-            #     w=w, f_hat=f_old, intercept=intercept_old, 
-            #     step=step, lam1=lam1, lam2=lam2, alpha=alpha, order=order, family=family, method=method, verbose=verbose, tf_kwargs=tf_kwargs)
             
             ls_converged, ls_iter, intercept_new, f_new, active_mask = \
                 self._prox_grad_line_search(
@@ -511,15 +646,23 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
             self.ls_status_.append(ls_converged)
             self.ls_n_iters_.append(ls_iter)
             
-            if self.family == 'gaussian':
-                loss_new = squared_loss(y, f_new, intercept_new)
+            loss_new = self._loss(y, f_new, intercept_new)            
+            obj_new = self._obj(X, y, f_new, intercept_new, active_mask)
                 
             if ls_converged:
                 # numer = np.mean((f_new - self.fhat_)**2) + \
                 #     (intercept_new - self.intercept_)**2
                 # denom = np.mean(self.fhat_**2) + (self.intercept_**2)
                 # rel_change = numer / (denom+1e-30)
+                rel_change = compute_rel_change(
+                    f_new, intercept_new, active_mask, n)
                 loss_change = self.loss_[-1] - loss_new
+                obj_change = self.obj_[-1] - obj_new
+            else:
+                loss_change = -np.inf 
+                obj_change = -np.inf
+                rel_change = 0
+                
             # else:
             #     # rel_change = 0
             #     loss_change = 0
@@ -527,19 +670,23 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
                 #     "Line search in iter #"+str(iter_)+" did not converge.")
                 
             self.loss_.append(loss_new)
-            
-            # self.rel_changes_.append(rel_change)
+            self.obj_.append(obj_new)
+            self.rel_changes_.append(rel_change)
 
             if self.verbose:
-                # print("[Fit] Relative change: "+str(rel_change))
-                print("[Fit] Loss change: "+str(loss_change))
+                print("[Fit] Relative change: "+str(rel_change))
+                # print("[Fit] Loss change: "+str(loss_change))
+                print("[Fit] Obj. change: "+str(obj_change))
             
+            # if ls_converged and obj_change > 0:
             if ls_converged:
                 self.intercept_ = intercept_new
                 self.fhat_ = f_new
                 self.active_mask_ = active_mask
+                
+                # step = 1 / (self.p_active_ + 1)
             else:
-                warnings.warn("Line search failed to converge. Algorithm will be stopped.")
+                warnings.warn("Line search failed to converge or objective increased. Algorithm will be stopped.")
                 converged = False
                 # self.status_ = "Line search failed."
                 break 
@@ -547,7 +694,9 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
                 # self.n_iter_ = 
                 # return None
                 
-            if (loss_change <= self.tol and loss_change > 0):
+            # if (loss_change <= self.tol and loss_change > 0):
+            # if (obj_change <= self.tol and obj_change > 0):
+            if (rel_change <= self.tol) and (iter_ > self.min_iter):
                 converged = True
                 if self.verbose:
                     run_time = time.time() - start_time
@@ -555,16 +704,17 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
                         "[Fit] Converged. Run time: {:.0f} seconds.".format(run_time))
                 self.status_ = "Converged!"   
             else:
-                if loss_change <= 0:
-                    warnings.warn("Loss did not decrease from iter. "+str(iter_)+" to iter. "+str(iter_+1)+".")
+                if obj_change <= 0:
+                    warnings.warn("Obj. did not decrease from iter. "+str(iter_)+" to iter. "+str(iter_+1)+".")
+                    # break
                     
                 iter_ = iter_ + 1
                 # res_old = res_old
                 # intercept_old, f_old = intercept_new, f_new
                 
-            if iter_ == self.max_iter:
-                warnings.warn("Max iter. was reached.")
-                self.status_ = "Max iter. reached."
+        if iter_ == self.max_iter:
+            warnings.warn("Max iter. was reached.")
+            self.status_ = "Max iter. reached."
             
         self.converged = converged
         self.n_iter_ = iter_
@@ -608,13 +758,14 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
                 self.active_mask_ = self.fhat_.any(axis=0)
 
             if self.init_intercept is None:
-                self.intercept_ = np.mean(y)
+                # self.intercept_ = np.mean(y)
+                self.intercept_ = 0
             else:
                 self.intercept_ = self.init_intercept
 
         # if not hasattr(self, 'step_'):
         if self.init_step_size is None:
-            self.step_ = y.shape[0] 
+            self.step_ = 1/(X.shape[1]+1) 
         else:
             self.step_ = self.init_step_size
         
@@ -631,6 +782,7 @@ class SparseAdditiveRegression(BaseEstimator,  RegressorMixin):
         self._prefit(X, y)
         
         self._fit(X, y, w=sample_weights, step=self.step_)
+        # self._fit_bcd(X, y, w=sample_weights)
         
         # init_intercept, init_fhat = self._prefit(X, y)
         

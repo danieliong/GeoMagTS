@@ -1,7 +1,10 @@
 from __future__ import print_function
+import cython
 import numpy as np 
 cimport numpy as np
 from cpython.mem cimport PyMem_Malloc, PyMem_Realloc, PyMem_Free
+from cpython cimport array
+import array
 from libc.stdlib cimport free 
 from libc.string cimport memcpy 
 from libc.stdio cimport printf
@@ -137,9 +140,14 @@ def maxlam_tf(np.ndarray x_ord, np.ndarray y_ord, np.ndarray w_ord, int k):
     return max_lam
 
 # Cython wrapper for tf_admm function in the glmgen C library
+@cython.boundscheck(False)
+@cython.wraparound(False)
 def trendfilter(
-    np.ndarray x_ord, np.ndarray y_ord, np.ndarray w_ord, int k, 
-    int family, int max_iter, int lam_flag, np.ndarray lam, int nlambda, 
+    np.ndarray[double, ndim=1, mode="c"] x_ord, 
+    np.ndarray[double, ndim=1, mode="c"] y_ord, 
+    np.ndarray[double, ndim=1, mode="c"] w_ord, int k, 
+    int family, int max_iter, int lam_flag, 
+    np.ndarray[double, ndim=1, mode="c"] lam, int nlambda, 
     double lambda_min_ratio, double rho, double obj_tol, 
     double obj_tol_newton, double alpha_ls, double gamma_ls, 
     int max_iter_ls, int max_iter_newton, int thinning, double x_tol, 
@@ -147,75 +155,74 @@ def trendfilter(
 
     cdef int n = y_ord.shape[0]
 
-    cdef double[:] lam_view = np.ascontiguousarray(lam, dtype=np.float64)
-    cdef double * lam_ptr = &lam_view[0]
+    cdef double * x_ptr = NULL
+    cdef double * y_ptr = NULL
+    cdef double * w_ptr = NULL
 
-    # print("lam: {}".format(lam_view[0]))
-
-    cdef double[:] x_view = np.ascontiguousarray(x_ord, dtype=np.float64)
-    cdef double[:] y_view = np.ascontiguousarray(y_ord, dtype=np.float64)
-    cdef double[:] w_view = np.ascontiguousarray(w_ord, dtype=np.float64)
-
-    cdef double * x_ptr
-    cdef double * y_ptr
-    cdef double * w_ptr
-    cdef double * xt_ptr
-    cdef double * yt_ptr
-    cdef double * wt_ptr
+    cdef double * xt_ptr = NULL
+    cdef double * yt_ptr = NULL
+    cdef double * wt_ptr = NULL
     cdef int nt
 
-    xt_ptr = NULL
-    yt_ptr = NULL
-    wt_ptr = NULL
+    cdef array.array int_temp = array.array('i', [])
+    cdef array.array d_temp = array.array('d', [])
+    cdef array.array df
+    cdef array.array fhat
+    cdef array.array obj
+    cdef array.array iter
+    cdef array.array status
+
+    cdef double[::1] xt
 
     # Thinning
     if thinning == 1:
-        thin(&x_view[0], &y_view[0], &w_view[0], n, k, &xt_ptr, &yt_ptr, 
+        thin(&x_ord[0], &y_ord[0], &w_ord[0], n, k, &xt_ptr, &yt_ptr, 
         &wt_ptr, &nt, x_tol)
 
-    # If data was thinned
-    if xt_ptr != NULL:
+    # If data was not thinned
+    if xt_ptr == NULL:
+        x_ptr = &x_ord[0]
+        y_ptr = &y_ord[0]
+        w_ptr = &w_ord[0]
+    else:
+        n = nt
         x_ptr = xt_ptr
         y_ptr = yt_ptr
         w_ptr = wt_ptr
-        n = nt
+
+    df = array.clone(int_temp, nlambda, zero=False)
+    fhat = array.clone(d_temp, n*nlambda, zero=False)
+    obj = array.clone(d_temp, nlambda*max_iter, zero=True)
+    iter = array.clone(int_temp, nlambda, zero=False)
+    status = array.clone(int_temp, nlambda, zero=False)
+
+    tf_admm(x_ptr, y_ptr, w_ptr, n, k, family, max_iter, lam_flag, &lam[0],
+    nlambda, lambda_min_ratio, &df.data.as_ints[0], &fhat.data.as_doubles[0], 
+    &obj.data.as_doubles[0], &iter.data.as_ints[0], &status.data.as_ints[0], rho, obj_tol, obj_tol_newton, alpha_ls, gamma_ls, max_iter_ls, max_iter_newton, verbose)
+
+
+    if xt_ptr == NULL:
+        res = dict(df=np.asarray(df, dtype=np.int16), 
+        f_hat=np.asarray(fhat, dtype=np.float64).reshape((nlambda, n)), 
+        obj=np.asarray(obj, dtype=np.float64).reshape((nlambda, max_iter)), 
+        iter=np.asarray(iter, dtype=np.int16), 
+        status=np.asarray(status, dtype=np.int16), 
+        x=None)
     else:
-        x_ptr = &x_view[0]
-        y_ptr = &y_view[0]
-        w_ptr = &w_view[0]
-    
-    # Allocate space for output
-    df_c = <int*> PyMem_Malloc(nlambda * sizeof(int))
-    fhat_c = <double*> PyMem_Malloc(nlambda * n * sizeof(double))
-    obj_c = <double*> PyMem_Malloc(nlambda * max_iter * sizeof(double))
-    iter_c = <int*> PyMem_Malloc(nlambda * sizeof(int))
-    status_c = <int*> PyMem_Malloc(nlambda * sizeof(int))
+        free(yt_ptr)
+        free(wt_ptr)
 
-    # Initialize elements in df, f_hat, obj, iter, status to 0 
-    for i in range(nlambda):
-        df_c[i] = 0;
-        for j in range(n):
-            fhat_c[i + j*nlambda] = 0
-        for j in range(max_iter):
-            obj_c[i + j*nlambda] = 0
-        iter_c[i] = 0
-        status_c[i] = 0
+        xt = <double[:nt]> xt_ptr
+        free(xt_ptr)
+        res = dict(df=np.asarray(df, dtype=np.int16), 
+        f_hat=np.asarray(fhat, dtype=np.float64).reshape((nlambda, n)), 
+        obj=np.asarray(obj, dtype=np.float64).reshape((nlambda, max_iter)), 
+        iter=np.asarray(iter, dtype=np.int16), 
+        status=np.asarray(status, dtype=np.int16), 
+        x=xt)
 
-    tf_admm(x_ptr, y_ptr, w_ptr, n, k, family, max_iter, lam_flag, lam_ptr,
-    nlambda, lambda_min_ratio, df_c, fhat_c, obj_c, iter_c, status_c, rho, obj_tol, obj_tol_newton, alpha_ls, gamma_ls, max_iter_ls, max_iter_newton, verbose)
+    return res
 
-    # Convert output to numpy arrays 
-    cdef np.ndarray df = np.asarray(<int[:nlambda]> df_c)
-    cdef np.ndarray f_hat = np.asarray(<double[:nlambda*n]> fhat_c).reshape((nlambda, n))
-    cdef np.ndarray obj = np.asarray(<double[:nlambda*max_iter]> obj_c).reshape((nlambda, max_iter))
-    cdef np.ndarray iter = np.asarray(<int[:nlambda]> iter_c)
-    cdef np.ndarray status = np.asarray(<int[:nlambda]> status_c)
-    cdef np.ndarray x_np = np.asarray(<double[:n]> x_ptr) 
-    res = dict(df=df, f_hat=f_hat, obj=obj, iter=iter, status=status, x=x_np)
-
-    # TODO: Free memory
-
-    return res 
 
 def predict_tf(
     np.ndarray x0, np.ndarray x, np.ndarray beta, int k, int family, 
@@ -274,23 +281,23 @@ def falling_fact_coefs_tf(np.ndarray x, int k, np.ndarray beta):
     return coefs
 
 
-def multiplyD_tf(np.ndarray x, int k, np.ndarray a):
+
+def multiplyD_tf(
+    np.ndarray[double, ndim=1, mode="c"] x, 
+    np.ndarray[double, ndim=1, mode="c"] a
+    int k):
 
     cdef int n = x.shape[0]
 
-    cdef double[:] x_view = np.ascontiguousarray(x, dtype=np.float64)
-    cdef double * x_ptr = &x_view[0]
+    cdef array.array d_temp = array.array('d', [])
+    cdef array.array b 
 
-    cdef double[:] a_view = np.ascontiguousarray(a, dtype=np.float64)
-    cdef double * a_ptr = &a_view[0]
+    b = array.clone(d_temp, n, zero=False)
 
-    b_c = <double*> PyMem_Malloc(n*sizeof(double))
+    tf_dx(&x[0], n, k, &a[0], &b.data.as_doubles[0])
 
-    tf_dx(x_ptr, n, k, a_ptr, b_c)
-
-    cdef np.ndarray b = np.asarray(<double[:n]> b_c)
-    return b
-
+    # cdef np.ndarray b = np.asarray(<double[:n]> b_c)
+    return np.asarray(b, dtype=np.float64)
 
 
 
