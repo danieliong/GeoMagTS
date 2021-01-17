@@ -1,23 +1,21 @@
+import warnings
+from functools import wraps
+
+import joblib
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from matplotlib.backends.backend_pdf import PdfPages
 from pandas.tseries.frequencies import to_offset
-
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.utils.validation import check_is_fitted, check_X_y, check_array
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import PolynomialFeatures
+from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 
-import warnings
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from matplotlib.backends.backend_pdf import PdfPages
-from lazyarray import larray
-from functools import wraps
-import joblib
-
-from GeoMagTS.utils import (MetaLagFeatureProcessor, _get_NA_mask, _pd_fit,
-                            _pd_transform, mse_masked, _check_file_name)
+from ..utils import (MetaLagFeatureProcessor, _check_file_name, _get_NA_mask,
+                     _pd_fit, _pd_transform, mse_masked)
 
 # NOTE: Get rid of sklearn-transformers?
 
@@ -299,8 +297,8 @@ class GeoMagARXProcessor():
 
         # Check if vx_colname is in X
         if check_vx_col and self.vx_colname not in X.columns:
-            raise ValueError("X does not have column " + self.vx_colname_ +
-                             ".")
+            raise ValueError("X does not have column " + self.vx_colname
+                             + ".")
 
         if check_same_cols:
             if not X.columns.equals(self.train_features_cols_):
@@ -698,8 +696,8 @@ class GeoMagARXProcessor():
         features_text = 'Features: ' + ', '.join(self.train_features_cols_)
 
         if interactive:
-            from plotly.subplots import make_subplots
             import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
 
             if sw_to_plot is not None:
                 fig = make_subplots(rows=len(sw_to_plot) + 1,
@@ -1070,8 +1068,8 @@ class GeoMagARXProcessor():
 
 class ARXFeatureProcessor(BaseEstimator, TransformerMixin):
     def __init__(self,
-                 auto_order=60,
-                 exog_order=60,
+                 auto_order=0,
+                 exog_order=2,
                  include_interactions=False,
                  interactions_degree=2,
                  seasonality=False,
@@ -1092,9 +1090,10 @@ class ARXFeatureProcessor(BaseEstimator, TransformerMixin):
     def fit(self,
             X,
             y=None,
-            target_column=0,
+            target_column=None,
             storm_level=0,
             time_level=1,
+            keep_pd=False,
             **transformer_fit_params):
 
         if self.transformer is not None:
@@ -1117,11 +1116,11 @@ class ARXFeatureProcessor(BaseEstimator, TransformerMixin):
         self.time_level_ = time_level
 
         # convert auto_order, exog_order to time steps
-        time_res_minutes = to_offset(self.time_resolution).delta.seconds / 60
-        self.auto_order_timesteps_ = np.rint(self.auto_order /
-                                             time_res_minutes).astype(int)
-        self.exog_order_timesteps_ = np.rint(self.exog_order /
-                                             time_res_minutes).astype(int)
+        # time_res_minutes = to_offset(self.time_resolution).delta.seconds / 60
+        # self.auto_order_timesteps_ = np.rint(self.auto_order /
+        #                                      time_res_minutes).astype(int)
+        # self.exog_order_timesteps_ = np.rint(self.exog_order /
+        #                                      time_res_minutes).astype(int)
 
         if self.transformer is not None:
             self.transformer.set_params(**self.transformer_params)
@@ -1159,12 +1158,16 @@ class ARXFeatureProcessor(BaseEstimator, TransformerMixin):
                 "X does not have regular time increments with the specified time resolution."
             )
 
-        y_ = X.iloc[:, self.target_column_].to_numpy()
-        X_ = X.drop(columns=X.columns[self.target_column_]).to_numpy()
+        if self.target_column_ is None:
+            y_ = None
+            X_ = X.to_numpy()
+        else:
+            y_ = X.iloc[:, self.target_column_].to_numpy()
+            X_ = X.drop(columns=X.columns[self.target_column_]).to_numpy()
 
         # TODO: write my own version
-        p = MetaLagFeatureProcessor(X_, y_, self.auto_order_timesteps_,
-                                    [self.exog_order_timesteps_] * X_.shape[1],
+        p = MetaLagFeatureProcessor(X_, y_, self.auto_order,
+                                    [self.exog_order] * X_.shape[1],
                                     [0] * X_.shape[1])
 
         features = p.generate_lag_features()
