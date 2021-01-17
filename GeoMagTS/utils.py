@@ -1,22 +1,24 @@
-from os import path
-import keras
-import pandas as pd
-import numpy as np
-from keras.models import Sequential
-from keras.layers import Dense
-from sklearn.utils import safe_mask
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.utils.validation import check_is_fitted
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.metrics import mean_squared_error
-from sklearn.pipeline import Pipeline
-from numpy.random import randint
+import itertools
+import warnings
 from collections import deque
 from functools import lru_cache
-import warnings
-import itertools
+from os import path
+
+import keras
+import numpy as np
+import pandas as pd
+from keras.layers import Dense
+from keras.models import Sequential
+from numpy.random import randint
 from pandas.api.types import is_datetime64_dtype, is_list_like
 from pandas.tseries.frequencies import to_offset
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.pipeline import Pipeline
+from sklearn.utils import safe_mask
+from sklearn.utils.validation import check_is_fitted
+
 
 # @lru_cache(maxsize=2048)
 def _read_data(data_file, **kwargs):
@@ -362,9 +364,13 @@ class MetaLagFeatureProcessor(object):
         if auto_order == 0 and exog_order.count(0) == len(exog_order):
             raise ValueError("auto_order and exog_order are all 0.")
 
-        self._lag_feature_processors = [
-            OutputLagFeatureProcessor(y, auto_order)
-        ]
+        if y is None:
+            self._lag_feature_processors = []
+        else:
+            self._lag_feature_processors = [
+                OutputLagFeatureProcessor(y, auto_order)
+            ]
+            
         self._lag_feature_processors.extend([
             InputLagFeatureProcessor(data, order, delay)
             for data, order, delay in zip(X.T, exog_order, exog_delay)
