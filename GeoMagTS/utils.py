@@ -364,13 +364,13 @@ class MetaLagFeatureProcessor(object):
         if auto_order == 0 and exog_order.count(0) == len(exog_order):
             raise ValueError("auto_order and exog_order are all 0.")
 
-        if y is None:
-            self._lag_feature_processors = []
-        else:
-            self._lag_feature_processors = [
-                OutputLagFeatureProcessor(y, auto_order)
-            ]
-            
+        self.y_exists_ = False if y is None else True
+        self._lag_feature_processors = []
+
+        if self.y_exists_:
+            self._lag_feature_processors.append(
+                OutputLagFeatureProcessor(y, auto_order))
+
         self._lag_feature_processors.extend([
             InputLagFeatureProcessor(data, order, delay)
             for data, order, delay in zip(X.T, exog_order, exog_delay)
@@ -378,10 +378,10 @@ class MetaLagFeatureProcessor(object):
 
     def generate_lag_features(self):
         lag_feature_list = [
-            p.generate_lag_features() for p in self._lag_feature_processors
+           p.generate_lag_features() for p in self._lag_feature_processors
         ]
 
-        if self.auto_order == 0:
+        if self.auto_order == 0 and self.y_exists_:
             lag_features = np.concatenate(lag_feature_list[1:],
                                           axis=1)
         elif np.all(self.exog_order == 0):
